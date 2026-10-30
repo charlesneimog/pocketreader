@@ -1,3 +1,52 @@
+export const DOCUMENT_DB_VERSION = 3;
+export const DOCUMENT_TRASH_STORE = "trash";
+
+export function extractActualDocumentFilename(key) {
+    const value = String(key || "");
+    if (!value.startsWith("file::")) return value;
+    return value.split("::")[1] || value;
+}
+
+export function createDocumentTrashId(key, docType = "pdf") {
+    return `${docType === "epub" ? "epub" : "pdf"}::${String(key || "")}`;
+}
+
+export function createLocalTrashEntry({
+    key,
+    docType = "pdf",
+    documentRecord,
+    progressEntries = {},
+    highlights = null,
+    title = "",
+    filename = "",
+    pendingServerDelete = false,
+    serverBacked = false,
+    googleDriveBacked = false,
+    deletedAt = new Date().toISOString(),
+} = {}) {
+    const format = docType === "epub" ? "epub" : "pdf";
+    const trashId = createDocumentTrashId(key, format);
+    const progress = progressEntries[`${format}::${key}`] || progressEntries[key] || null;
+    const resolvedFilename =
+        String(filename || documentRecord?.name || extractActualDocumentFilename(key) || "Untitled").trim() ||
+        "Untitled";
+    return {
+        trashId,
+        storageKey: key,
+        filename: resolvedFilename,
+        title: String(title || progress?.title || resolvedFilename).trim() || resolvedFilename,
+        format,
+        deletedAt,
+        size: Number(documentRecord?.blob?.size ?? documentRecord?.size ?? 0) || 0,
+        document: documentRecord,
+        progressEntries,
+        highlights,
+        pendingServerDelete: !!pendingServerDelete,
+        serverBacked: !!serverBacked,
+        googleDriveBacked: !!googleDriveBacked,
+    };
+}
+
 export class ProgressManager {
     constructor(app) {
         this.app = app;
@@ -39,6 +88,18 @@ export class ProgressManager {
         return null;
     }
 
+    canSyncCurrentPosition() {
+        const { state } = this.app;
+        if (state.currentDocumentType !== "pdf") return true;
+        const currentPage = Number(state.currentSentence?.pageNumber);
+        if (!Number.isInteger(currentPage) || currentPage < 1) return false;
+        if (!(state.parsedPdfPages instanceof Set)) return false;
+        for (let pageNumber = 1; pageNumber <= currentPage; pageNumber++) {
+            if (!state.parsedPdfPages.has(pageNumber)) return false;
+        }
+        return true;
+    }
+
     saveProgress() {
         const { state } = this.app;
         if (!state.sentences.length || state.currentSentenceIndex < 0) return;
@@ -71,6 +132,9 @@ export class ProgressManager {
                       currentPage: Number.isFinite(state.currentSentence?.pageNumber)
                           ? state.currentSentence.pageNumber
                           : 0,
+                      pageSentenceIndex: Number.isFinite(state.currentSentence?.pageSentenceIndex)
+                          ? state.currentSentence.pageSentenceIndex
+                          : 0,
                       totalPages: Number.isFinite(state.pdf?.numPages) ? state.pdf.numPages : 0,
                   }
                 : {}),
@@ -88,10 +152,10 @@ export class ProgressManager {
         // Sync to server if enabled
         if (this.app.serverSync?.isEnabled()) {
             const fileId = docType === "epub" ? state.currentEpubKey : state.currentPdfKey;
-            if (fileId) {
+            if (fileId && this.canSyncCurrentPosition()) {
                 this.app.serverSync.queuePositionSync(fileId, state.currentSentenceIndex);
-                if (state.currentPiperVoice) this.app.serverSync.queueVoiceSync(fileId, state.currentPiperVoice);
             }
+            if (fileId && state.currentPiperVoice) this.app.serverSync.queueVoiceSync(fileId, state.currentPiperVoice);
         }
     }
 
@@ -127,7 +191,7 @@ export class ProgressManager {
 
     async _openDb() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open("PDFStorage", 2);
+            const request = indexedDB.open("PDFStorage", DOCUMENT_DB_VERSION);
             request.onupgradeneeded = (event) => {
                 const db = event.target.result;
                 if (!db.objectStoreNames.contains("pdfs")) {
@@ -135,6 +199,9 @@ export class ProgressManager {
                 }
                 if (!db.objectStoreNames.contains("epubs")) {
                     db.createObjectStore("epubs");
+                }
+                if (!db.objectStoreNames.contains(DOCUMENT_TRASH_STORE)) {
+                    db.createObjectStore(DOCUMENT_TRASH_STORE);
                 }
             };
             request.onsuccess = (event) => resolve(event.target.result);
@@ -307,6 +374,237 @@ export class ProgressManager {
             deleteRequest.onerror = () => {
                 db.close();
                 reject(deleteRequest.error);
+            };
+        });
+    }
+
+    _captureProgressEntries(key, docType) {
+        const progressMap = this.getProgressMap();
+        const entries = {};
+        const compoundKey = this._progressKey(docType, key);
+        if (Object.hasOwn(progressMap, compoundKey)) entries[compoundKey] = progressMap[compoundKey];
+        if (docType === "pdf" && Object.hasOwn(progressMap, key)) entries[key] = progressMap[key];
+        return entries;
+    }
+
+    _captureHighlights(key) {
+        const highlightsMap = this.app.highlightsStorage?.getHighlightsMap?.() || {};
+        return Object.hasOwn(highlightsMap, key) ? highlightsMap[key] : null;
+    }
+
+    _removeDocumentState(key, docType) {
+        this.clearDocumentProgress(docType, key);
+        this.app.highlightsStorage?.clearPdfHighlights?.(key);
+    }
+
+    _restoreDocumentState(entry) {
+        const progressEntries = entry?.progressEntries;
+        if (progressEntries && typeof progressEntries === "object") {
+            this.setProgressMap({ ...this.getProgressMap(), ...progressEntries });
+        }
+
+        if (entry && Object.hasOwn(entry, "highlights") && entry.highlights !== null) {
+            const highlightsMap = this.app.highlightsStorage?.getHighlightsMap?.() || {};
+            highlightsMap[entry.storageKey] = entry.highlights;
+            this.app.highlightsStorage?.setHighlightsMap?.(highlightsMap);
+        }
+    }
+
+    /**
+     * Atomically move a stored PDF/EPUB payload into IndexedDB trash. Reading
+     * progress and highlights are copied into the same trash record. Their
+     * active localStorage entries are removed after the IndexedDB commit.
+     */
+    async moveDocumentToTrash(key, docType = "pdf", metadata = {}) {
+        if (!key) throw new Error("A document key is required");
+        const format = docType === "epub" ? "epub" : "pdf";
+        const trashId = createDocumentTrashId(key, format);
+        const sourceStoreName = format === "epub" ? "epubs" : "pdfs";
+        const progressEntries = this._captureProgressEntries(key, format);
+        const highlights = this._captureHighlights(key);
+        const db = await this._openDb();
+
+        const entry = await new Promise((resolve, reject) => {
+            const tx = db.transaction([sourceStoreName, DOCUMENT_TRASH_STORE], "readwrite");
+            const sourceStore = tx.objectStore(sourceStoreName);
+            const trashStore = tx.objectStore(DOCUMENT_TRASH_STORE);
+            const getRequest = sourceStore.get(key);
+            let nextEntry = null;
+            let missing = false;
+
+            getRequest.onsuccess = () => {
+                if (!getRequest.result) {
+                    const existingRequest = trashStore.get(trashId);
+                    existingRequest.onsuccess = () => {
+                        if (existingRequest.result) {
+                            nextEntry = {
+                                ...existingRequest.result,
+                                serverBacked: !!(existingRequest.result.serverBacked || metadata.serverBacked),
+                                googleDriveBacked: !!(
+                                    existingRequest.result.googleDriveBacked || metadata.googleDriveBacked
+                                ),
+                                pendingServerDelete:
+                                    metadata.pendingServerDelete === undefined
+                                        ? !!existingRequest.result.pendingServerDelete
+                                        : !!metadata.pendingServerDelete,
+                            };
+                            trashStore.put(nextEntry, trashId);
+                        }
+                        else {
+                            missing = true;
+                            tx.abort();
+                        }
+                    };
+                    return;
+                }
+                nextEntry = createLocalTrashEntry({
+                    key,
+                    docType: format,
+                    documentRecord: getRequest.result,
+                    progressEntries,
+                    highlights,
+                    title: metadata.title,
+                    filename: metadata.filename,
+                    pendingServerDelete: metadata.pendingServerDelete,
+                    serverBacked: metadata.serverBacked,
+                    googleDriveBacked: metadata.googleDriveBacked,
+                });
+                trashStore.put(nextEntry, trashId);
+                sourceStore.delete(key);
+            };
+            tx.oncomplete = () => {
+                db.close();
+                resolve(nextEntry);
+            };
+            tx.onerror = () => {
+                const error = tx.error;
+                db.close();
+                reject(error);
+            };
+            tx.onabort = () => {
+                const error = missing ? new Error("The local document could not be found") : tx.error;
+                db.close();
+                reject(error);
+            };
+        });
+
+        this._removeDocumentState(key, format);
+        return entry;
+    }
+
+    async listTrashDocuments() {
+        const db = await this._openDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(DOCUMENT_TRASH_STORE, "readonly");
+            const request = tx.objectStore(DOCUMENT_TRASH_STORE).getAll();
+            request.onsuccess = () => {
+                db.close();
+                resolve(Array.isArray(request.result) ? request.result : []);
+            };
+            request.onerror = () => {
+                const error = request.error;
+                db.close();
+                reject(error);
+            };
+        });
+    }
+
+    async restoreDocumentFromTrash(trashId) {
+        if (!trashId) throw new Error("A trash id is required");
+        const db = await this._openDb();
+        const entry = await new Promise((resolve, reject) => {
+            const tx = db.transaction(["pdfs", "epubs", DOCUMENT_TRASH_STORE], "readwrite");
+            const trashStore = tx.objectStore(DOCUMENT_TRASH_STORE);
+            const getRequest = trashStore.get(trashId);
+            let restored = null;
+            let missing = false;
+
+            getRequest.onsuccess = () => {
+                restored = getRequest.result;
+                if (!restored?.document) {
+                    missing = true;
+                    tx.abort();
+                    return;
+                }
+                const destination = restored.format === "epub" ? "epubs" : "pdfs";
+                tx.objectStore(destination).put(restored.document, restored.storageKey);
+                trashStore.delete(trashId);
+            };
+            tx.oncomplete = () => {
+                db.close();
+                resolve(restored);
+            };
+            tx.onerror = () => {
+                const error = tx.error;
+                db.close();
+                reject(error);
+            };
+            tx.onabort = () => {
+                const error = missing ? new Error("The trashed document could not be found") : tx.error;
+                db.close();
+                reject(error);
+            };
+        });
+        this._restoreDocumentState(entry);
+        return entry;
+    }
+
+    async deleteTrashDocument(trashId) {
+        if (!trashId) return;
+        const db = await this._openDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(DOCUMENT_TRASH_STORE, "readwrite");
+            tx.objectStore(DOCUMENT_TRASH_STORE).delete(trashId);
+            tx.oncomplete = () => {
+                db.close();
+                resolve();
+            };
+            tx.onerror = () => {
+                const error = tx.error;
+                db.close();
+                reject(error);
+            };
+        });
+    }
+
+    async updateTrashDocument(trashId, changes = {}) {
+        if (!trashId) throw new Error("A trash id is required");
+        const db = await this._openDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(DOCUMENT_TRASH_STORE, "readwrite");
+            const store = tx.objectStore(DOCUMENT_TRASH_STORE);
+            const request = store.get(trashId);
+            let updated = null;
+            request.onsuccess = () => {
+                if (!request.result) return;
+                updated = { ...request.result, ...changes, trashId };
+                store.put(updated, trashId);
+            };
+            tx.oncomplete = () => {
+                db.close();
+                resolve(updated);
+            };
+            tx.onerror = () => {
+                const error = tx.error;
+                db.close();
+                reject(error);
+            };
+        });
+    }
+
+    async emptyTrash() {
+        const db = await this._openDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(DOCUMENT_TRASH_STORE, "readwrite");
+            tx.objectStore(DOCUMENT_TRASH_STORE).clear();
+            tx.oncomplete = () => {
+                db.close();
+                resolve();
+            };
+            tx.onerror = () => {
+                const error = tx.error;
+                db.close();
+                reject(error);
             };
         });
     }

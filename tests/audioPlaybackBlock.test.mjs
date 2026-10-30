@@ -80,6 +80,21 @@ test("startup buffering permits a single remaining phrase at document end", () =
     });
 });
 
+test("remaps active audio indexes when a lazy earlier PDF page is inserted", () => {
+    const manager = Object.create(AudioManager.prototype);
+    const first = { text: "First" };
+    const second = { text: "Second" };
+    const timer = setTimeout(() => {}, 10_000);
+    manager._playbackContext = { sentenceIndex: 1, gaplessTimer: timer };
+    manager._preparedMediaBridge = { sentenceIndex: 0 };
+
+    manager.handleSentenceReindex([first, second], [{ text: "Earlier" }, first, second]);
+
+    assert.equal(manager._playbackContext.sentenceIndex, 2);
+    assert.equal(manager._playbackContext.gaplessTimer, null);
+    assert.equal(manager._preparedMediaBridge.sentenceIndex, 1);
+});
+
 test("HTML audio receives the synthesized speech as PCM WAV", async () => {
     const manager = Object.create(AudioManager.prototype);
     const samples = new Float32Array([0.75, -0.5]);

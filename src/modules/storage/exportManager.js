@@ -14,6 +14,14 @@ export class ExportManager {
         }
         try {
             this.app.ui.showInfo("Preparing PDF export...");
+            const highlightedPages = new Set();
+            for (const highlight of state.savedHighlights.values()) {
+                const pageIndex = Number(highlight?.pageIndex);
+                if (Number.isFinite(pageIndex)) highlightedPages.add(pageIndex + 1);
+            }
+            for (const pageNumber of Array.from(highlightedPages).sort((a, b) => a - b)) {
+                await this.app.pdfLoader?.ensurePageParsed?.(pageNumber);
+            }
             let pdfBytes;
             if (state.currentPdfDescriptor.type === "file") {
                 if (state.currentPdfDescriptor.fileObject) {

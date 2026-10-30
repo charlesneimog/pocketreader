@@ -39,6 +39,7 @@ export class PDFLoader {
     constructor(app) {
         this.app = app;
         this._headerFooterStylesInjected = false;
+        this._pdfParseGeneration = 0;
     }
 
     computePdfKeyFromSource(source) {
@@ -61,28 +62,44 @@ export class PDFLoader {
         return { name, size: Number.isFinite(size) ? size : 0 };
     }
 
-    async preprocessPage(pageNumber) {
+    _ensureLazyPageState() {
+        const { state } = this.app;
+        if (!(state.pagesCache instanceof Map)) state.pagesCache = new Map();
+        if (!(state.viewportDisplayByPage instanceof Map)) state.viewportDisplayByPage = new Map();
+        if (!(state.pdfSentencesByPage instanceof Map)) state.pdfSentencesByPage = new Map();
+        if (!(state.parsedPdfPages instanceof Set)) state.parsedPdfPages = new Set();
+        if (!(state.pdfPageParsePromises instanceof Map)) state.pdfPageParsePromises = new Map();
+        if (!(state.pageSentencesIndex instanceof Map)) state.pageSentencesIndex = new Map();
+        if (!Array.isArray(state.sentences)) state.sentences = [];
+    }
+
+    _isCurrentParse(pdfDocument, generation) {
+        return this.app.state.pdf === pdfDocument && this._pdfParseGeneration === generation;
+    }
+
+    async preprocessPage(
+        pageNumber,
+        { pdfDocument = this.app.state.pdf, generation = this._pdfParseGeneration } = {},
+    ) {
         const { app } = this;
         const { state } = app;
+        this._ensureLazyPageState();
 
-        if (state.viewportDisplayByPage.has(pageNumber)) return;
-        const page = await state.pdf.getPage(pageNumber);
-        state.pagesCache.set(pageNumber, page);
+        const cachedPage = state.pagesCache.get(pageNumber);
+        if (cachedPage && Array.isArray(cachedPage.pageWords)) return cachedPage;
+        if (!pdfDocument || !this._isCurrentParse(pdfDocument, generation)) return null;
+
+        const page = cachedPage || (await pdfDocument.getPage(pageNumber));
+        if (!this._isCurrentParse(pdfDocument, generation)) return null;
 
         const unscaled = page.getViewport({ scale: 1 });
-        const BASE_WIDTH_CSS = app.config.BASE_WIDTH_CSS();
+        const BASE_WIDTH_CSS =
+            typeof app.config?.BASE_WIDTH_CSS === "function" ? app.config.BASE_WIDTH_CSS() : unscaled.width;
         const displayScale = BASE_WIDTH_CSS / unscaled.width;
         const viewportDisplay = page.getViewport({ scale: displayScale });
-        state.viewportDisplayByPage.set(pageNumber, viewportDisplay);
-
-        // Store base/unscaled metrics to support lazy rescaling later
-        page.unscaledWidth = unscaled.width;
-        page.unscaledHeight = unscaled.height;
-        page.baseDisplayScale = displayScale; // initial scale used to compute pageWords below
-        page.currentDisplayScale = displayScale; // will change on orientation/resize
-        page.needsWordRescale = false; // becomes true when display scale changes
 
         const textContent = await page.getTextContent();
+        if (!this._isCurrentParse(pdfDocument, generation)) return null;
         const pageWords = [];
 
         for (const item of textContent.items) {
@@ -153,7 +170,131 @@ export class PDFLoader {
             }
         }
 
+        // Commit only after extraction completes. An old PDF.js task may resolve
+        // after another document has opened, and must not populate the new caches.
+        state.pagesCache.set(pageNumber, page);
+        state.viewportDisplayByPage.set(pageNumber, viewportDisplay);
+        // Store base/unscaled metrics to support lazy rescaling later.
+        page.unscaledWidth = unscaled.width;
+        page.unscaledHeight = unscaled.height;
+        page.baseDisplayScale = displayScale;
+        page.currentDisplayScale = displayScale;
+        page.needsWordRescale = false;
         page.pageWords = pageWords;
+        return page;
+    }
+
+    async ensurePageParsed(pageNumber, { prefetchNext = false } = {}) {
+        const { app } = this;
+        const { state } = app;
+        this._ensureLazyPageState();
+
+        const normalizedPage = Number.parseInt(pageNumber, 10);
+        const pdfDocument = state.pdf;
+        if (
+            !pdfDocument ||
+            !Number.isFinite(normalizedPage) ||
+            normalizedPage < 1 ||
+            normalizedPage > pdfDocument.numPages
+        ) {
+            return null;
+        }
+
+        if (state.parsedPdfPages.has(normalizedPage)) {
+            const parsedPage = state.pagesCache.get(normalizedPage) || null;
+            if (prefetchNext) void this.prefetchNextPage(normalizedPage);
+            return parsedPage;
+        }
+        const pending = state.pdfPageParsePromises.get(normalizedPage);
+        if (pending) {
+            const parsedPage = await pending;
+            if (prefetchNext) void this.prefetchNextPage(normalizedPage);
+            return parsedPage;
+        }
+
+        const generation = this._pdfParseGeneration;
+        const parsePromise = (async () => {
+            const page = await this.preprocessPage(normalizedPage, { pdfDocument, generation });
+            if (!page || !this._isCurrentParse(pdfDocument, generation)) return null;
+
+            await app.sentenceParser.parsePageWords(normalizedPage, page, {
+                expectedPdf: pdfDocument,
+                isCurrent: () => this._isCurrentParse(pdfDocument, generation),
+                skipLayoutDetection: true,
+            });
+            if (!this._isCurrentParse(pdfDocument, generation)) return null;
+
+            state.parsedPdfPages.add(normalizedPage);
+            if (state.savedHighlights instanceof Map && state.savedHighlights.size) {
+                state.savedHighlights = app.highlightsStorage.remapPdfHighlights(state.savedHighlights);
+            }
+            app.interactionHandler?.setupInteractionListeners?.();
+            app.pdfRenderer?.updateHighlightDisplay?.();
+            if (state.generationEnabled && state.currentSentenceIndex >= 0) {
+                app.ttsEngine?.schedulePrefetch?.();
+            }
+            return page;
+        })();
+
+        state.pdfPageParsePromises.set(normalizedPage, parsePromise);
+        try {
+            const page = await parsePromise;
+            if (prefetchNext && page) void this.prefetchNextPage(normalizedPage);
+            return page;
+        } finally {
+            if (state.pdfPageParsePromises.get(normalizedPage) === parsePromise) {
+                state.pdfPageParsePromises.delete(normalizedPage);
+            }
+        }
+    }
+
+    async prefetchNextPage(pageNumber) {
+        const nextPage = Number.parseInt(pageNumber, 10) + 1;
+        const pageCount = Number(this.app.state.pdf?.numPages) || 0;
+        if (nextPage < 1 || nextPage > pageCount) return null;
+        try {
+            return await this.ensurePageParsed(nextPage);
+        } catch (error) {
+            console.warn(`[PDFLoader] Could not pre-parse page ${nextPage}`, error);
+            return null;
+        }
+    }
+
+    async getFirstSentenceIndexForPage(pageNumber) {
+        const { state } = this.app;
+        const pageCount = Number(state.pdf?.numPages) || 0;
+        const pdfDocument = state.pdf;
+        const normalizedPage = Math.min(Math.max(Number.parseInt(pageNumber, 10) || 1, 1), pageCount);
+        await this.ensurePageParsed(normalizedPage, { prefetchNext: true });
+        if (state.pdf !== pdfDocument) return -1;
+        const indices = state.pageSentencesIndex.get(normalizedPage) || [];
+        return indices.length ? indices[0] : -1;
+    }
+
+    async getAdjacentSentenceIndex(sentence, direction = 1) {
+        const { state } = this.app;
+        if (!sentence || !state.pdf) return -1;
+        const pdfDocument = state.pdf;
+        const step = direction < 0 ? -1 : 1;
+        const currentPage = Number(sentence.pageNumber);
+        const pageIndices = state.pageSentencesIndex.get(currentPage) || [];
+        const currentOffset = pageIndices.indexOf(sentence.index);
+        const adjacentOffset = currentOffset + step;
+        if (currentOffset >= 0 && adjacentOffset >= 0 && adjacentOffset < pageIndices.length) {
+            return pageIndices[adjacentOffset];
+        }
+
+        for (
+            let pageNumber = currentPage + step;
+            pageNumber >= 1 && pageNumber <= state.pdf.numPages;
+            pageNumber += step
+        ) {
+            await this.ensurePageParsed(pageNumber, { prefetchNext: step > 0 });
+            if (state.pdf !== pdfDocument || !state.sentences.includes(sentence)) return -1;
+            const indices = state.pageSentencesIndex.get(pageNumber) || [];
+            if (indices.length) return step > 0 ? indices[0] : indices[indices.length - 1];
+        }
+        return -1;
     }
 
     async _preprocessPages(pageCount) {
@@ -166,11 +307,90 @@ export class PDFLoader {
         const worker = async () => {
             while (nextPage <= pageCount) {
                 const pageNumber = nextPage++;
-                await this.preprocessPage(pageNumber);
+                await this.ensurePageParsed(pageNumber);
                 await cooperativeYield();
             }
         };
         await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    }
+
+    _hasLegacyIndexedHighlights(highlights) {
+        if (!(highlights instanceof Map) || !highlights.size) return false;
+        for (const data of highlights.values()) {
+            if (
+                !Number.isFinite(Number(data?.pageIndex)) ||
+                !Array.isArray(data?.words) ||
+                data.words.length === 0
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    _resolvePageSentenceIndex(pageNumber, pageSentenceIndex = 0, fallbackIndex = 0) {
+        const { state } = this.app;
+        const indices = state.pageSentencesIndex?.get?.(pageNumber) || [];
+        if (indices.length) {
+            const offset = Math.min(
+                Math.max(Number.parseInt(pageSentenceIndex, 10) || 0, 0),
+                indices.length - 1,
+            );
+            return indices[offset];
+        }
+        const fallback = Number.parseInt(fallbackIndex, 10);
+        if (Number.isFinite(fallback) && fallback >= 0 && fallback < state.sentences.length) {
+            return fallback;
+        }
+        return state.sentences.length ? 0 : -1;
+    }
+
+    async _ensurePageWithSentences(startPageNumber) {
+        const { state } = this.app;
+        const pageCount = Number(state.pdf?.numPages) || 0;
+        const currentPage = Math.min(Math.max(1, startPageNumber), pageCount);
+        await this.ensurePageParsed(currentPage);
+        if (state.pageSentencesIndex.get(currentPage)?.length) return currentPage;
+
+        const nextPage = currentPage + 1;
+        if (nextPage <= pageCount) {
+            await this.ensurePageParsed(nextPage);
+            if (state.pageSentencesIndex.get(nextPage)?.length) return nextPage;
+        }
+        return currentPage;
+    }
+
+    async _ensureLegacySentenceIndex(sentenceIndex) {
+        const { state } = this.app;
+        const target = Number.parseInt(sentenceIndex, 10);
+        if (!Number.isFinite(target) || target < 0) return false;
+        for (let pageNumber = 1; pageNumber <= state.pdf.numPages; pageNumber++) {
+            await this.ensurePageParsed(pageNumber);
+            if (state.sentences.length > target) return true;
+            await cooperativeYield();
+        }
+        return state.sentences.length > target;
+    }
+
+    async _reparseLoadedPages() {
+        const { app } = this;
+        const { state } = app;
+        await Promise.allSettled(Array.from(state.pdfPageParsePromises?.values?.() || []));
+        const pageNumbers = Array.from(state.parsedPdfPages || [])
+            .map(Number)
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b);
+        state.pdfSentencesByPage.clear();
+        state.pageSentencesIndex.clear();
+        state.sentences = [];
+        for (const pageNumber of pageNumbers) {
+            const page = state.pagesCache.get(pageNumber);
+            if (!page?.pageWords) continue;
+            await app.sentenceParser.parsePageWords(pageNumber, page, { expectedPdf: state.pdf });
+        }
+        if (state.savedHighlights instanceof Map) {
+            state.savedHighlights = app.highlightsStorage.remapPdfHighlights(state.savedHighlights);
+        }
     }
 
     async loadPDF(file = null, { resume = true, existingKey = null } = {}) {
@@ -262,6 +482,10 @@ export class PDFLoader {
                 }
             }
 
+            // Invalidate any page extraction that is still resolving for the
+            // previous document before replacing its PDF.js worker.
+            this._pdfParseGeneration += 1;
+
             // A newly opened document replaces the previous PDF.js worker and its
             // font/operator caches. Waiting for GC here is unreliable on iPadOS.
             if (state.pdf?.destroy) {
@@ -305,10 +529,21 @@ export class PDFLoader {
             state.currentDocumentType = "pdf";
             if (!state.pdf.numPages) throw new Error("PDF has no pages.");
 
+            const localSavedPosition = state.currentPdfKey
+                ? app.progressManager.loadSavedPosition(state.currentPdfKey, "pdf")
+                : null;
+            const savedPage = Number.parseInt(localSavedPosition?.currentPage, 10);
+            const hasSavedPage = Number.isInteger(savedPage) && savedPage >= 1;
+            const requestedPage =
+                resume && hasSavedPage
+                    ? Math.min(Math.max(savedPage, 1), state.pdf.numPages)
+                    : 1;
+            state.currentPdfPage = requestedPage;
+
             if (app.ui.playbackPreparationActive) {
-                app.ui.updatePlaybackPreparation(`Extracting text from ${state.pdf.numPages} pages…`);
+                app.ui.updatePlaybackPreparation(`Extracting text from page ${requestedPage}…`);
             } else {
-                app.ui.showMessage(`Extracting text from ${state.pdf.numPages} pages…`, 0);
+                app.ui.showMessage(`Extracting text from page ${requestedPage}…`, 0);
             }
 
             // Model initialization is independent of PDF text extraction. Start it
@@ -319,19 +554,35 @@ export class PDFLoader {
                     console.warn("[PDFLoader] Layout model warmup failed", error);
                 });
 
-            await this._preprocessPages(state.pdf.numPages);
-
-            // Build sentences (now with layout filtering)
-            if (app.ui.playbackPreparationActive) {
-                app.ui.updatePlaybackPreparation("Building the sentence list…");
+            const requiresLegacyIndexing = this._hasLegacyIndexedHighlights(state.savedHighlights);
+            let activeResumePage = requestedPage;
+            if (requiresLegacyIndexing) {
+                // Old highlight records only contain a global sentence index.
+                // Keep their one-time compatibility path eager so those anchors
+                // can be migrated without silently attaching to another phrase.
+                await this._preprocessPages(state.pdf.numPages);
             } else {
-                app.ui.showMessage("Building the sentence list…", 0);
+                activeResumePage = await this._ensurePageWithSentences(requestedPage);
             }
-            await app.sentenceParser.buildSentences(1);
             state.savedHighlights = app.highlightsStorage.remapPdfHighlights(state.savedHighlights);
+            if (requiresLegacyIndexing && state.savedHighlights.size && state.currentPdfKey) {
+                app.highlightsStorage.saveHighlights(state.currentPdfKey, state.savedHighlights);
+                state.savedHighlights = app.highlightsStorage.remapPdfHighlights(
+                    app.highlightsStorage.loadSavedHighlights(state.currentPdfKey),
+                );
+            }
 
-            let startIndex = 0;
-            let resumeVoiceId = null;
+            const savedPageSentenceIndex = Number.parseInt(localSavedPosition?.pageSentenceIndex, 10) || 0;
+            let startIndex = this._resolvePageSentenceIndex(
+                activeResumePage > 0 ? activeResumePage : requestedPage,
+                activeResumePage === requestedPage ? savedPageSentenceIndex : 0,
+                localSavedPosition?.sentenceIndex,
+            );
+            let resumeVoiceId =
+                resume && typeof localSavedPosition?.voice === "string" && localSavedPosition.voice.trim()
+                    ? localSavedPosition.voice.trim()
+                    : null;
+            let serverPosition = null;
 
             // First, try to load from server if enabled
             if (app.serverSync?.isEnabled() && state.currentPdfKey) {
@@ -340,7 +591,7 @@ export class PDFLoader {
 
                     // Update position from server if available
                     if (serverData.position !== null && serverData.position >= 0) {
-                        startIndex = Math.min(Math.max(serverData.position, 0), state.sentences.length - 1);
+                        serverPosition = serverData.position;
                         //console.log(`[PDFLoader] Restored position from server: ${startIndex}`);
                     }
 
@@ -357,18 +608,29 @@ export class PDFLoader {
                             serverData.highlights,
                         );
                         state.savedHighlights = serverData.highlights;
+                        const serverNeedsLegacyIndexing = this._hasLegacyIndexedHighlights(serverData.highlights);
                         if (serverSplitVersion !== state.phraseSplitVersion) {
                             state.phraseSplitVersion = serverSplitVersion;
-                            await app.sentenceParser.buildSentences(1);
-                            startIndex = Math.min(startIndex, Math.max(0, state.sentences.length - 1));
+                            if (serverNeedsLegacyIndexing) await this._preprocessPages(state.pdf.numPages);
+                            await this._reparseLoadedPages();
+                        } else if (serverNeedsLegacyIndexing && state.parsedPdfPages.size < state.pdf.numPages) {
+                            await this._preprocessPages(state.pdf.numPages);
                         }
                         state.savedHighlights = app.highlightsStorage.remapPdfHighlights(
                             state.savedHighlights,
                         );
+                        if (serverNeedsLegacyIndexing) {
+                            app.highlightsStorage.ensurePdfWordAnchors(state.savedHighlights);
+                            app.serverSync
+                                ?.syncHighlights?.(state.currentPdfKey, state.savedHighlights)
+                                .catch?.((error) => {
+                                    console.warn("[PDFLoader] Failed to migrate remote highlight anchors", error);
+                                });
+                        }
                         //console.log(`[PDFLoader] Restored ${serverData.highlights.size} highlights from server`);
 
                         // Also save to local storage
-                        app.highlightsStorage?.saveHighlights?.(state.currentPdfKey, serverData.highlights);
+                        app.highlightsStorage?.saveHighlights?.(state.currentPdfKey, state.savedHighlights);
                     }
 
                     // Persist server translation preferences locally for prompt defaults.
@@ -395,25 +657,42 @@ export class PDFLoader {
                 }
             }
 
-            // If no server data, load from local storage
-            if (startIndex === 0 && state.currentPdfKey) {
-                const saved = app.progressManager.loadSavedPosition(state.currentPdfKey);
-                if (saved) {
-                    if (typeof saved.sentenceIndex === "number") {
-                        startIndex = Math.min(Math.max(saved.sentenceIndex, 0), state.sentences.length - 1);
-                    }
-                    if (resume && typeof saved.voice === "string" && saved.voice.trim()) {
-                        resumeVoiceId = saved.voice.trim();
-                    }
-                }
+            // A server-only legacy position is usable when all preceding pages
+            // have been parsed. New local progress resumes by page + page offset.
+            const hasLocalPageLocator = resume && hasSavedPage;
+            if (
+                Number.isFinite(serverPosition) &&
+                serverPosition >= state.sentences.length &&
+                !hasLocalPageLocator
+            ) {
+                await this._ensureLegacySentenceIndex(serverPosition);
+            }
+            if (
+                Number.isFinite(serverPosition) &&
+                (!hasLocalPageLocator || requiresLegacyIndexing) &&
+                serverPosition >= 0 &&
+                serverPosition < state.sentences.length
+            ) {
+                startIndex = serverPosition;
+            } else {
+                startIndex = this._resolvePageSentenceIndex(
+                    activeResumePage > 0 ? activeResumePage : requestedPage,
+                    activeResumePage === requestedPage ? savedPageSentenceIndex : 0,
+                    startIndex,
+                );
             }
 
             if (resume && resumeVoiceId) {
                 await this._applySavedVoice(resumeVoiceId);
             }
 
+            const resumeSentence = state.sentences[startIndex] || null;
             if (state.viewMode === "full") {
                 await app.pdfRenderer.renderFullDocumentIfNeeded();
+            }
+            if (resumeSentence) {
+                const rebuiltIndex = state.sentences.indexOf(resumeSentence);
+                if (rebuiltIndex >= 0) startIndex = rebuiltIndex;
             }
 
             // Load highlights from local storage if not already loaded from server
@@ -425,17 +704,27 @@ export class PDFLoader {
                 const lastSaved = Array.from(state.savedHighlights.values()).pop();
                 if (lastSaved?.color) state.selectedHighlightColor = lastSaved.color;
             }
+            const renderPage = state.sentences[startIndex]?.pageNumber || activeResumePage || requestedPage;
             if (app.ui.playbackPreparationActive) {
-                app.ui.updatePlaybackPreparation("Rendering the first page…");
+                app.ui.updatePlaybackPreparation(`Rendering page ${renderPage}…`);
             } else {
-                app.ui.showMessage("Rendering the first page…", 0);
+                app.ui.showMessage(`Rendering page ${renderPage}…`, 0);
             }
-            await app.pdfRenderer.renderSentence(startIndex);
-            app.ui.showInfo(`Total sentences: ${state.sentences.length}`);
+            if (startIndex >= 0) {
+                await app.pdfRenderer.renderSentence(startIndex);
+            } else {
+                await app.pdfRenderer.ensurePageCanvasMounted(renderPage);
+            }
+            void this.prefetchNextPage(renderPage);
+            app.ui.showInfo(`Page ${renderPage} ready`);
             app.interactionHandler.setupInteractionListeners();
             app.controlsManager.reflectSelectedHighlightColor();
 
-            app.eventBus.emit(EVENTS.PDF_LOADED, { pages: state.pdf.numPages, sentences: state.sentences.length });
+            app.eventBus.emit(EVENTS.PDF_LOADED, {
+                pages: state.pdf.numPages,
+                sentences: state.sentences.length,
+                parsedPages: state.parsedPdfPages.size,
+            });
             app.eventBus.emit(EVENTS.SENTENCES_PARSED, state.sentences);
             this._warmInitialPageForPlayback();
             const header = document.getElementById("previous-pdf-header");
@@ -555,17 +844,36 @@ export class PDFLoader {
 
         if (resolvedIndex < 0) {
             // Attempt to find the next readable sentence by processing pages on demand
-            for (let i = 0; i < state.sentences.length; i++) {
-                const sentence = state.sentences[i];
+            for (const sentence of [...state.sentences]) {
                 if (!sentence || sentence.layoutProcessed) continue;
                 await app.pdfRenderer.ensureFullPageRendered(sentence.pageNumber);
                 await app.getPdfHeaderFooterDetector().ensureReadabilityForPage(sentence.pageNumber, {
                     force: forceRebuild,
                 });
                 if (sentence.layoutProcessed && sentence.isTextToRead) {
-                    resolvedIndex = sentence.index;
+                    resolvedIndex = state.sentences.indexOf(sentence);
                     break;
                 }
+                await cooperativeYield();
+            }
+        }
+
+        if (resolvedIndex < 0) {
+            const firstUnparsedPage = Math.max(1, Number(prevSentence?.pageNumber) || 1);
+            for (let pageNumber = firstUnparsedPage; pageNumber <= state.pdf.numPages; pageNumber++) {
+                if (!state.parsedPdfPages.has(pageNumber)) {
+                    await this.ensurePageParsed(pageNumber, { prefetchNext: true });
+                }
+                const indices = state.pageSentencesIndex.get(pageNumber) || [];
+                if (!indices.length) continue;
+                const pageSentences = indices.map((index) => state.sentences[index]).filter(Boolean);
+                await app.pdfRenderer.ensureFullPageRendered(pageNumber);
+                await app.getPdfHeaderFooterDetector().ensureReadabilityForPage(pageNumber, {
+                    force: forceRebuild,
+                });
+                const readableSentence = pageSentences.find((sentence) => sentence.isTextToRead);
+                resolvedIndex = readableSentence ? state.sentences.indexOf(readableSentence) : -1;
+                if (resolvedIndex >= 0) break;
                 await cooperativeYield();
             }
         }

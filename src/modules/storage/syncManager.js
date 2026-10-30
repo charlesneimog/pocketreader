@@ -35,6 +35,15 @@ export class SyncManager {
     ensureFileOnServer(...args) { return this.active.ensureFileOnServer(...args); }
     pullServerStateUpdates(...args) { return this.active.pullServerStateUpdates(...args); }
     deleteFileOnServer(...args) { return this.active.deleteFileOnServer(...args); }
+    hasSelfHostedServerConfigured() { return !!this.server.getServerUrl(); }
+    isServerTrashAvailable() { return this.server.isEnabled(); }
+    listTrash(...args) { return this.server.listTrash(...args); }
+    restoreTrashFile(...args) { return this.server.restoreTrashFile(...args); }
+    deleteTrashFile(...args) { return this.server.deleteTrashFile(...args); }
+    emptyServerTrash(...args) { return this.server.emptyTrash(...args); }
+    syncRestoredTrashFromServer(...args) { return this.server.syncFromServer(...args); }
+    uploadRestoredTrashFile(...args) { return this.server.uploadRestoredTrashFile(...args); }
+    restoreGoogleDriveFile(...args) { return this.drive.restoreFile(...args); }
     checkServerAvailability(...args) { return this.active.checkServerAvailability(...args); }
     syncAll(...args) { return this.active.syncAll(...args); }
     syncFromServer(...args) { return this.active.syncFromServer(...args); }

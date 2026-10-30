@@ -478,7 +478,7 @@ export class PDFThumbnailCache {
             "absolute top-1 right-1 flex items-center justify-center w-6 h-6 rounded-lg bg-slate-200/80 dark:bg-slate-900/80 hover:bg-slate-300 dark:hover:bg-slate-700 transition-opacity opacity-0 group-hover:opacity-100";
 
         closeBtn.innerHTML = `<span class="material-symbols-outlined text-text-secondary dark:text-slate-400 !text-sm">close</span>`;
-        closeBtn.setAttribute("aria-label", `Delete ${pdfName}`);
+        closeBtn.setAttribute("aria-label", `Move ${pdfName} to Trash`);
 
         closeBtn.addEventListener("click", async (e) => {
             e.stopPropagation();
@@ -494,15 +494,21 @@ export class PDFThumbnailCache {
 
         const syncManager = this.app.serverSync;
         const googleDriveSelected = syncManager?.getBackend?.() === "google-drive";
+        const selfHostedTrashAvailable = !!syncManager?.isServerTrashAvailable?.();
+        const selfHostedServerConfigured =
+            !googleDriveSelected && !!syncManager?.hasSelfHostedServerConfigured?.();
+        let pendingServerDelete = false;
 
-        // Confirm deletion
-        const location = googleDriveSelected ? " from this device and Google Drive" : " from history";
-        if (!confirm(`Delete "${pdfName}"${location}?`)) return;
+        const prompt = googleDriveSelected
+            ? `Move "${pdfName}" to Trash on this device and delete its Google Drive copy?`
+            : `Move "${pdfName}" to Trash?`;
+        if (!confirm(prompt)) return;
 
         if (cardElement?.dataset) cardElement.dataset.deleting = "true";
 
-        // With Drive selected, delete remotely first. Keeping the local copy when
-        // Drive is unavailable prevents another device from restoring the file.
+        // Delete/soft-delete the selected remote copy first. Keeping the local
+        // copy active when a remote mutation fails prevents the next sync from
+        // unexpectedly undoing the user's action.
         if (googleDriveSelected) {
             if (!syncManager?.isEnabled?.()) {
                 this.app.ui?.showInfo?.("Reconnect Google Drive before deleting this file");
@@ -524,28 +530,39 @@ export class PDFThumbnailCache {
             }
         }
 
-        if (docType === "epub") {
-            await this.app.progressManager.clearEpubProgress(pdfKey);
-            await this.app.progressManager.removeEpubFromIndexedDB(pdfKey);
-        } else {
-            await this.app.progressManager.clearPdfProgress(pdfKey);
-            this.app.highlightsStorage?.clearPdfHighlights?.(pdfKey);
-            await this.app.progressManager.removePdfFromIndexedDB(pdfKey);
+        if (selfHostedServerConfigured) {
+            if (selfHostedTrashAvailable) {
+                const ok = await syncManager.deleteFileOnServer(pdfKey);
+                pendingServerDelete = !ok;
+                if (!ok) console.warn("[PDFThumbnailCache] Server Trash move queued", { key: pdfKey });
+            } else {
+                pendingServerDelete = true;
+            }
         }
 
-        // Best-effort server deletion (creates a tombstone so other instances purge too).
-        if (!googleDriveSelected && syncManager?.isEnabled?.()) {
-            const ok = await syncManager.deleteFileOnServer(pdfKey);
-            if (!ok) {
-                console.warn("[PDFThumbnailCache] Failed to delete file on server", { key: pdfKey });
-                this.app.ui?.showInfo?.("Failed to delete file on server");
-            }
+        try {
+            await this.app.progressManager.moveDocumentToTrash(pdfKey, docType, {
+                title: pdfName,
+                filename: pdfName,
+                pendingServerDelete,
+                serverBacked: selfHostedServerConfigured,
+                googleDriveBacked: googleDriveSelected,
+            });
+        } catch (error) {
+            console.warn("[PDFThumbnailCache] Failed to move local file to Trash", error);
+            this.app.ui?.showInfo?.(`Could not move to Trash: ${pdfName}`);
+            if (cardElement?.dataset) delete cardElement.dataset.deleting;
+            return;
         }
 
         this.app.ui?.showInfo?.(
             googleDriveSelected
-                ? `Deleted locally and from Google Drive: ${pdfName}`
-                : `Deleted locally: ${pdfName}`,
+                ? `Moved to device Trash and deleted from Google Drive: ${pdfName}`
+                : pendingServerDelete
+                  ? `Moved to device Trash; server move queued: ${pdfName}`
+                  : selfHostedServerConfigured
+                    ? `Moved to Trash: ${pdfName}`
+                  : `Moved to Trash on this device: ${pdfName}`,
         );
 
         // Animate removal

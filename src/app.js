@@ -1101,6 +1101,11 @@ export class PDFTTSApp {
 
     // Public API methods preserving original signatures:
     async loadPDF(file = null, options = {}) {
+        if (file instanceof File && this.state.pdf) {
+            // Page-number keyed layout work from the previous PDF must not be
+            // allowed to complete into the new document's caches.
+            this.releasePdfHeaderFooterDetector();
+        }
         // Layout initialization does not depend on the selected language, voice,
         // or parsed PDF pages. Start it before awaiting the setup popup so model
         // download/cache lookup and ONNX session creation overlap user choice.
@@ -1208,42 +1213,74 @@ export class PDFTTSApp {
         return result;
     }
 
-    nextSentence(manual = true) {
+    async nextSentence(manual = true) {
         const { state } = this;
+        if (state.currentDocumentType === "pdf" && state.currentSentence) {
+            const pdf = state.pdf;
+            const sentence = state.currentSentence;
+            this.audioManager.stopPlayback(true);
+            if (manual) state.autoAdvanceActive = false;
+            const nextIndex = await this.pdfLoader.getAdjacentSentenceIndex(sentence, 1);
+            if (state.pdf !== pdf || !state.sentences.includes(sentence)) return;
+            if (nextIndex >= 0) await this.pdfRenderer.renderSentence(nextIndex);
+            return;
+        }
         if (state.currentSentenceIndex < state.sentences.length - 1) {
             this.audioManager.stopPlayback(true);
             if (manual) state.autoAdvanceActive = false;
-            this.getActiveRenderer().renderSentence(state.currentSentenceIndex + 1);
+            await this.getActiveRenderer().renderSentence(state.currentSentenceIndex + 1);
         }
     }
 
-    prevSentence(manual = true) {
+    async prevSentence(manual = true) {
         const { state } = this;
+        if (state.currentDocumentType === "pdf" && state.currentSentence) {
+            const pdf = state.pdf;
+            const sentence = state.currentSentence;
+            this.audioManager.stopPlayback(true);
+            if (manual) state.autoAdvanceActive = false;
+            const previousIndex = await this.pdfLoader.getAdjacentSentenceIndex(sentence, -1);
+            if (state.pdf !== pdf || !state.sentences.includes(sentence)) return;
+            if (previousIndex >= 0) await this.pdfRenderer.renderSentence(previousIndex);
+            return;
+        }
         if (state.currentSentenceIndex > 0) {
             this.audioManager.stopPlayback(true);
             if (manual) state.autoAdvanceActive = false;
-            this.getActiveRenderer().renderSentence(state.currentSentenceIndex - 1);
+            await this.getActiveRenderer().renderSentence(state.currentSentenceIndex - 1);
         }
     }
 
-    nextPageNav() {
+    async nextPageNav() {
         const { state } = this;
-        const currentPage = state.currentSentence?.pageNumber || 1;
+        const currentPage = state.currentPdfPage || state.currentSentence?.pageNumber || 1;
         const totalPages = this._getTotalPageCount();
         if (!totalPages) return;
+        const pdf = state.pdf;
         const target = Math.min(totalPages, currentPage + 1);
-        const firstIdx = state.sentences.findIndex((s) => s.pageNumber === target);
-        if (firstIdx >= 0) this.getActiveRenderer().renderSentence(firstIdx);
+        const firstIdx =
+            state.currentDocumentType === "pdf"
+                ? await this.pdfLoader.getFirstSentenceIndexForPage(target)
+                : state.sentences.findIndex((s) => s.pageNumber === target);
+        if (state.currentDocumentType === "pdf" && state.pdf !== pdf) return;
+        if (firstIdx >= 0) await this.getActiveRenderer().renderSentence(firstIdx);
+        else if (state.currentDocumentType === "pdf") await this.pdfRenderer.renderPage(target);
     }
 
-    prevPageNav() {
+    async prevPageNav() {
         const { state } = this;
-        const currentPage = state.currentSentence?.pageNumber || 1;
+        const currentPage = state.currentPdfPage || state.currentSentence?.pageNumber || 1;
         const totalPages = this._getTotalPageCount();
         if (!totalPages) return;
+        const pdf = state.pdf;
         const target = Math.max(1, Math.min(totalPages, currentPage - 1));
-        const firstIdx = state.sentences.findIndex((s) => s.pageNumber === target);
-        if (firstIdx >= 0) this.getActiveRenderer().renderSentence(firstIdx);
+        const firstIdx =
+            state.currentDocumentType === "pdf"
+                ? await this.pdfLoader.getFirstSentenceIndexForPage(target)
+                : state.sentences.findIndex((s) => s.pageNumber === target);
+        if (state.currentDocumentType === "pdf" && state.pdf !== pdf) return;
+        if (firstIdx >= 0) await this.getActiveRenderer().renderSentence(firstIdx);
+        else if (state.currentDocumentType === "pdf") await this.pdfRenderer.renderPage(target);
     }
 
     togglePlay() {
@@ -1381,6 +1418,7 @@ export class PDFTTSApp {
             // PDF cleanup: clear renderer highlights and free caches
             if (this._pdfRenderer && typeof this._pdfRenderer.clearFullDocHighlights === "function") {
                 try {
+                    this._pdfRenderer.disconnectFullDocumentObserver?.();
                     this._pdfRenderer.clearFullDocHighlights();
                 } catch (e) {
                     console.debug("closeCurrentDocument: pdfRenderer.clearFullDocHighlights failed", e);
@@ -1406,6 +1444,10 @@ export class PDFTTSApp {
                 state.viewportDisplayByPage?.clear?.();
                 state.fullPageRenderCache?.clear?.();
                 state.pageSentencesIndex?.clear?.();
+                state.pdfSentencesByPage?.clear?.();
+                state.parsedPdfPages?.clear?.();
+                state.pdfPageParsePromises?.clear?.();
+                state.currentPdfPage = 1;
                 state.prefetchedPages?.clear?.();
                 state.sentences = [];
                 state.currentSentenceIndex = -1;

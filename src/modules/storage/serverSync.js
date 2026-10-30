@@ -31,6 +31,7 @@ export class ServerSync {
         this._positionSyncTimers = new Map();
         this._voiceSyncTimers = new Map();
         this._rewardsSyncTimer = null;
+        this._pendingTrashFlushPromise = null;
 
         // Throttle server -> client state pulls (position/highlights/voice)
         this.serverPullIntervalMs = 30000; // Check every 30 seconds
@@ -175,6 +176,31 @@ export class ServerSync {
             body: { enabled: !!enabled, timezone: timezone || "UTC" },
             withAuth: true,
         });
+    }
+
+    async listTrash() {
+        const data = await this.apiFetch("/api/trash", { method: "GET", withAuth: true });
+        return Array.isArray(data?.files) ? data.files : [];
+    }
+
+    async restoreTrashFile(fileId) {
+        if (!fileId) throw new Error("A trashed file id is required");
+        return await this.apiFetch(`/api/trash/${this._encodeFileIdForUrl(fileId)}/restore`, {
+            method: "POST",
+            withAuth: true,
+        });
+    }
+
+    async deleteTrashFile(fileId) {
+        if (!fileId) throw new Error("A trashed file id is required");
+        return await this.apiFetch(`/api/trash/${this._encodeFileIdForUrl(fileId)}`, {
+            method: "DELETE",
+            withAuth: true,
+        });
+    }
+
+    async emptyTrash() {
+        return await this.apiFetch("/api/trash", { method: "DELETE", withAuth: true });
     }
 
     _getAuthToken() {
@@ -405,15 +431,11 @@ export class ServerSync {
 
             const matching = keys.filter((k) => this._extractActualFilename(k) === actual);
             for (const k of matching) {
-                if (docType === "epub") {
-                    this.app.progressManager.clearEpubProgress(k);
-                    this.app.highlightsStorage?.clearPdfHighlights?.(k);
-                    await this.app.progressManager.removeEpubFromIndexedDB(k);
-                } else {
-                    this.app.progressManager.clearPdfProgress(k);
-                    this.app.highlightsStorage?.clearPdfHighlights?.(k);
-                    await this.app.progressManager.removePdfFromIndexedDB(k);
-                }
+                await this.app.progressManager.moveDocumentToTrash(k, docType, {
+                    filename: actual,
+                    serverBacked: true,
+                    pendingServerDelete: false,
+                });
                 removed++;
             }
         } catch (e) {
@@ -437,11 +459,37 @@ export class ServerSync {
             removed += count;
 
             if (showMessages && count > 0) {
-                this.app.ui?.showInfo?.(`Removed deleted file: ${actualName}`);
+                this.app.ui?.showInfo?.(`Moved to Trash: ${actualName}`);
             }
         }
 
         return removed;
+    }
+
+    async _flushPendingTrashDeletes() {
+        if (this._pendingTrashFlushPromise) return await this._pendingTrashFlushPromise;
+        this._pendingTrashFlushPromise = (async () => {
+            const entries = await this.app.progressManager?.listTrashDocuments?.();
+            const pending = (Array.isArray(entries) ? entries : []).filter((entry) => entry?.pendingServerDelete);
+            for (const entry of pending) {
+                if (!this.isEnabled()) return false;
+                const ok = await this.deleteFileOnServer(entry.storageKey);
+                if (!ok) return false;
+                await this.app.progressManager.updateTrashDocument(entry.trashId, {
+                    pendingServerDelete: false,
+                    serverBacked: true,
+                });
+            }
+            return true;
+        })();
+        try {
+            return await this._pendingTrashFlushPromise;
+        } catch (error) {
+            this._logServerError("[ServerSync] Failed to flush queued Trash moves:", error);
+            return false;
+        } finally {
+            this._pendingTrashFlushPromise = null;
+        }
     }
 
     async _maybePullServerStateUpdates() {
@@ -506,6 +554,7 @@ export class ServerSync {
         if (!serverUrl) return;
 
         try {
+            if (!(await this._flushPendingTrashDeletes())) return;
             const response = await this._fetch(`${serverUrl}/api/files`, {
                 method: "GET",
                 headers: { "Content-Type": "application/json" },
@@ -868,7 +917,7 @@ export class ServerSync {
         }
     }
 
-    async uploadFile(file, fileId, format, voice = null) {
+    async uploadFile(file, fileId, format, voice = null, titleOverride = "") {
         const serverUrl = this.getServerUrl();
         if (!serverUrl) {
             console.warn("[ServerSync] No server URL configured");
@@ -877,7 +926,7 @@ export class ServerSync {
 
         try {
             const { state } = this.app;
-            const title = state.bookTitle || file.name || "Untitled";
+            const title = titleOverride || state.bookTitle || file.name || "Untitled";
 
             const formData = new FormData();
             formData.append("file", file);
@@ -919,6 +968,21 @@ export class ServerSync {
             }
             return false;
         }
+    }
+
+    async uploadRestoredTrashFile(entry) {
+        if (!this.isEnabled() || !entry?.storageKey) return false;
+        const blob = entry.document?.blob || entry.document;
+        if (!(blob instanceof Blob)) return false;
+        const filename = entry.filename || this._extractActualFilename(entry.storageKey) || "document";
+        const type = entry.format === "epub" ? "application/epub+zip" : "application/pdf";
+        const file = blob instanceof File
+            ? blob
+            : new File([blob], filename, { type: blob.type || type, lastModified: Date.now() });
+        const progress = entry.progressEntries?.[`${entry.format}::${entry.storageKey}`]
+            || entry.progressEntries?.[entry.storageKey]
+            || null;
+        return await this.uploadFile(file, entry.storageKey, entry.format, progress?.voice || null, entry.title || filename);
     }
 
     async syncPosition(fileId, sentenceIndex) {
@@ -1440,7 +1504,7 @@ export class ServerSync {
             }
 
             // Sync position
-            if (state.currentSentenceIndex >= 0) {
+            if (state.currentSentenceIndex >= 0 && this.app.progressManager.canSyncCurrentPosition()) {
                 await this.syncPosition(fileId, state.currentSentenceIndex);
             }
 
@@ -1534,6 +1598,7 @@ export class ServerSync {
         }
 
         try {
+            if (!(await this._flushPendingTrashDeletes())) return;
             // Get list of files from server
             const response = await this._fetch(`${serverUrl}/api/files`, {
                 method: "GET",

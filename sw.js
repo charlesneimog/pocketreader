@@ -1,4 +1,4 @@
-const APP_VERSION = "0.48.0+0";
+const APP_VERSION = "0.49.0+0";
 const IDB_VERSION = 1;
 const cacheName = `PocketReader-v${APP_VERSION}`;
 const runtimeCache = `PocketReader-runtime-v${APP_VERSION}`;
@@ -140,6 +140,7 @@ const staticFiles = [
     "/src/modules/ui/rewardsPanel.js",
     "/src/modules/ui/sessionProgressWidget.js",
     "/src/modules/ui/sessionSetupDialog.js",
+    "/src/modules/ui/trashDialog.js",
     "/src/modules/utils/ariaManager.js",
     "/src/modules/utils/coordinates.js",
     "/src/modules/utils/helpers.js",

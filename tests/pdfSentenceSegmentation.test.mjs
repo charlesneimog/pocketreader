@@ -102,3 +102,34 @@ test("retains PDF layout boundaries and resets unfinished parentheses there", as
     });
     assert.deepEqual(app.state.sentences.map(({ text }) => text), ["Header (", "First sentence.", "Next sentence."]);
 });
+
+test("keeps lazy page sentences in document order when an earlier page is parsed later", async () => {
+    const state = {
+        sentences: [],
+        pdfSentencesByPage: new Map(),
+        pageSentencesIndex: new Map(),
+        generationEnabled: false,
+        currentSentenceIndex: -1,
+        playingSentenceIndex: -1,
+        hoveredSentenceIndex: -1,
+        phraseSplitVersion: CONFIG.PHRASE_SPLIT_VERSION,
+        currentDocumentType: "pdf",
+    };
+    const app = { config: CONFIG, state };
+    const parser = new SentenceParser(app);
+    const page = (str) => ({
+        pageWords: [{ str, x: 10, y: 20, width: 80, height: 10 }],
+    });
+
+    await parser.parsePageWords(2, page("Second page."));
+    const activeSentence = state.sentences[0];
+    state.currentSentenceIndex = 0;
+
+    await parser.parsePageWords(1, page("First page."));
+
+    assert.deepEqual(state.sentences.map(({ pageNumber }) => pageNumber), [1, 2]);
+    assert.equal(state.sentences[1], activeSentence);
+    assert.equal(state.currentSentenceIndex, 1);
+    assert.deepEqual(state.pageSentencesIndex.get(1), [0]);
+    assert.deepEqual(state.pageSentencesIndex.get(2), [1]);
+});

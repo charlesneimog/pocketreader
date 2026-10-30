@@ -677,6 +677,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if path == "/api/reading-digest-preferences":
             self._send_json(200, app.get_email_digest_preference(user_email))
             return
+
+        if path == "/api/trash":
+            files = app.get_trashed_files(owner_email=user_email)
+            logger.info("List trash: owner=%s count=%d", user_email, len(files))
+            self._send_json(200, {"files": files})
+            return
         
         # GET /api/files - List all files
         if path == "/api/rewards":
@@ -1035,6 +1041,17 @@ class APIHandler(BaseHTTPRequestHandler):
         if not user_email:
             return
 
+        # POST /api/trash/{file_id}/restore
+        match = re.fullmatch(r'/api/trash/(.+)/restore', path)
+        if match:
+            file_id = _normalize_file_id(unquote(match.group(1)))
+            logger.info("Trash restore request: owner=%s file_id=%s", user_email, file_id)
+            if app.restore_file_from_trash(file_id, owner_email=user_email):
+                self._send_json(200, {"success": True, "restored": True})
+            else:
+                self._send_error(404, "File not found in trash")
+            return
+
         # POST /api/translate
         if path == "/api/translate":
             logger.info("Translate request: owner=%s", user_email)
@@ -1156,6 +1173,25 @@ class APIHandler(BaseHTTPRequestHandler):
 
         user_email = self._require_auth()
         if not user_email:
+            return
+
+        # DELETE /api/trash permanently removes recoverable payloads, while
+        # preserving sync tombstones that protect against stale re-uploads.
+        if path == "/api/trash":
+            count = app.empty_trash(owner_email=user_email)
+            logger.info("Empty trash: owner=%s count=%d", user_email, count)
+            self._send_json(200, {"success": True, "deleted": count})
+            return
+
+        # DELETE /api/trash/{file_id}
+        match = re.fullmatch(r'/api/trash/(.+)', path)
+        if match:
+            file_id = _normalize_file_id(unquote(match.group(1)))
+            logger.info("Trash purge request: owner=%s file_id=%s", user_email, file_id)
+            if app.purge_trashed_file(file_id, owner_email=user_email):
+                self._send_json(200, {"success": True, "deleted": True})
+            else:
+                self._send_error(404, "File not found in trash")
             return
 
         # DELETE /api/files/{file_id}

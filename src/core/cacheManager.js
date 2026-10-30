@@ -16,6 +16,9 @@ export class CacheManager {
         this.state.viewportDisplayByPage.clear();
         this.state.fullPageRenderCache.clear();
         this.state.audioCache.clear();
+        this.state.pdfSentencesByPage?.clear?.();
+        this.state.parsedPdfPages?.clear?.();
+        this.state.pdfPageParsePromises?.clear?.();
         if (this.state.chapterCache?.clear) this.state.chapterCache.clear();
         if (this.state.prefetchedChapters?.clear) this.state.prefetchedChapters.clear();
     }

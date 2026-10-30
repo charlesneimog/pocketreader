@@ -540,10 +540,10 @@ export class AudioManager {
         if (!sentence) return null;
 
         let current = sentence;
-        let attempts = 0;
-        const limit = state.sentences.length || 0;
+        const visited = new Set();
 
-        while (current && attempts < limit) {
+        while (current && !visited.has(current)) {
+            visited.add(current);
             if (current.isTextToRead && hasUsableSpeechText(this._extractSpeechText(current))) {
                 return current;
             }
@@ -552,14 +552,16 @@ export class AudioManager {
                 this._markSentenceAsSilent(current);
             }
 
-            const nextIndex = state.currentSentenceIndex + 1;
-            if (nextIndex >= state.sentences.length) {
+            const nextIndex =
+                state.currentDocumentType === "pdf"
+                    ? await this.app.pdfLoader.getAdjacentSentenceIndex(current, 1)
+                    : state.currentSentenceIndex + 1;
+            if (nextIndex < 0 || nextIndex >= state.sentences.length) {
                 return null;
             }
 
             await this.app.pdfRenderer.renderSentence(nextIndex, { autoAdvance: true });
             current = state.currentSentence;
-            attempts += 1;
         }
 
         return null;
@@ -631,6 +633,31 @@ export class AudioManager {
         }
     }
 
+    handleSentenceReindex(previousSentences, nextSentences) {
+        if (!Array.isArray(previousSentences) || !Array.isArray(nextSentences)) return;
+        const remapIndex = (index) => {
+            if (!Number.isInteger(index) || index < 0) return -1;
+            const sentence = previousSentences[index];
+            return sentence ? nextSentences.indexOf(sentence) : -1;
+        };
+
+        const context = this._playbackContext;
+        if (context) {
+            const nextIndex = remapIndex(context.sentenceIndex);
+            if (nextIndex >= 0) context.sentenceIndex = nextIndex;
+            if (context.gaplessTimer) {
+                clearTimeout(context.gaplessTimer);
+                context.gaplessTimer = null;
+            }
+        }
+
+        if (this._preparedMediaBridge) {
+            const nextPreparedIndex = remapIndex(this._preparedMediaBridge.sentenceIndex);
+            if (nextPreparedIndex >= 0) this._preparedMediaBridge.sentenceIndex = nextPreparedIndex;
+            else this._releasePreparedMediaBridge();
+        }
+    }
+
     _findPreparedNextSentenceIndex(finishedIndex) {
         const { state } = this.app;
         for (let index = finishedIndex + 1; index < state.sentences.length; index++) {
@@ -677,8 +704,21 @@ export class AudioManager {
         if (!overlap) this._pauseMediaBridge();
         this.app.pdfRenderer.updateHighlightFullDoc();
 
-        const hasNextSentence =
-            typeof finishedIndex === "number" && finishedIndex >= 0 && finishedIndex < state.sentences.length - 1;
+        const currentFinishedIndex = state.sentences.indexOf(sentence);
+        let nextSentenceIndex =
+            currentFinishedIndex >= 0 && currentFinishedIndex < state.sentences.length - 1
+                ? currentFinishedIndex + 1
+                : -1;
+        if (state.autoAdvanceActive && state.currentDocumentType === "pdf") {
+            try {
+                nextSentenceIndex = await this.app.pdfLoader.getAdjacentSentenceIndex(sentence, 1);
+            } catch (error) {
+                console.warn("Unable to prepare the next PDF page", error);
+                nextSentenceIndex = -1;
+            }
+        }
+        const hasNextSentence = nextSentenceIndex >= 0;
+        let nextSentence = hasNextSentence ? state.sentences[nextSentenceIndex] : null;
 
         if (!state.autoAdvanceActive || !hasNextSentence) {
             state.autoAdvanceActive = false;
@@ -700,11 +740,27 @@ export class AudioManager {
         // for that completion to be persisted and, when required, block TTS and
         // open the reflection dialog before starting the following sentence.
         await this.app.rewards?.handleReadingBoundary?.();
+        if (!this._isContextActive(context) || state.stopRequested) return;
+
+        let resolvedFinishedIndex = state.sentences.indexOf(sentence);
+        if (resolvedFinishedIndex < 0) resolvedFinishedIndex = finishedIndex;
+        nextSentenceIndex = nextSentence ? state.sentences.indexOf(nextSentence) : -1;
+        if (nextSentenceIndex < 0 && state.currentDocumentType === "pdf") {
+            nextSentenceIndex = await this.app.pdfLoader.getAdjacentSentenceIndex(sentence, 1);
+            nextSentence = nextSentenceIndex >= 0 ? state.sentences[nextSentenceIndex] : null;
+        }
+        if (nextSentenceIndex < 0) {
+            state.autoAdvanceActive = false;
+            this._invalidateContext(context);
+            this._setMediaSessionPlaybackState("paused");
+            this.app.eventBus.emit(EVENTS.AUDIO_PLAYBACK_END, { index: resolvedFinishedIndex });
+            return;
+        }
 
         // The next phrase is normally synthesized by prefetch. Start it before
         // canvas mounting, scrolling, and progress persistence so those UI tasks
         // cannot create an audible gap between HTML audio tracks.
-        const preparedNextIndex = this._findPreparedNextSentenceIndex(finishedIndex);
+        const preparedNextIndex = this._findPreparedNextSentenceIndex(resolvedFinishedIndex);
         if (preparedNextIndex >= 0 && !this._playbackBlocks.size) {
             state.currentSentenceIndex = preparedNextIndex;
             this._invalidateContext(context);
@@ -715,12 +771,12 @@ export class AudioManager {
                     skipTTS: true,
                 }),
             ).catch((error) => console.warn("Deferred auto-advance render failed", error));
-            this.app.eventBus.emit(EVENTS.AUDIO_PLAYBACK_END, { index: finishedIndex });
+            this.app.eventBus.emit(EVENTS.AUDIO_PLAYBACK_END, { index: resolvedFinishedIndex });
             return;
         }
 
         try {
-            await this.app.pdfRenderer.renderSentence(finishedIndex + 1, { autoAdvance: true });
+            await this.app.pdfRenderer.renderSentence(nextSentenceIndex, { autoAdvance: true });
         } catch (err) {
             console.warn("Auto-advance render failed", err);
             state.autoAdvanceActive = false;
@@ -730,9 +786,9 @@ export class AudioManager {
             return;
         }
 
-        const nextSentence = state.sentences[state.currentSentenceIndex];
+        const advancedSentence = state.sentences[state.currentSentenceIndex];
         this._invalidateContext(context);
-        if (!state.generationEnabled || nextSentence?.isTextToRead) {
+        if (!state.generationEnabled || advancedSentence?.isTextToRead) {
             await this.playCurrentSentence();
         }
         this.app.eventBus.emit(EVENTS.AUDIO_PLAYBACK_END, { index: state.currentSentenceIndex });

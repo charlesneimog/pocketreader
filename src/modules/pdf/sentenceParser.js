@@ -22,7 +22,9 @@ export class SentenceParser {
 
         state.sentences = [];
         state.pageSentencesIndex.clear();
-        for (let pageNum = 1; pageNum <= state.pdf.numPages; pageNum++) {
+        if (!(state.pdfSentencesByPage instanceof Map)) state.pdfSentencesByPage = new Map();
+        state.pdfSentencesByPage.clear();
+        for (let pageNum = startPageNumber; pageNum <= state.pdf.numPages; pageNum++) {
             const page = state.pagesCache.get(pageNum);
             if (!page?.pageWords) {
                 console.warn(`[SentenceParser] No words found for page ${pageNum}`);
@@ -36,13 +38,87 @@ export class SentenceParser {
         }
     }
 
-    async parsePageWords(pageNumber, page) {
+    _rebuildPdfSentenceIndex() {
+        const { state } = this.app;
+        if (!(state.pdfSentencesByPage instanceof Map)) state.pdfSentencesByPage = new Map();
+        if (!(state.pageSentencesIndex instanceof Map)) state.pageSentencesIndex = new Map();
+
+        const previousSentences = Array.isArray(state.sentences) ? state.sentences : [];
+        const currentSentence = previousSentences[state.currentSentenceIndex] || null;
+        const playingSentence = previousSentences[state.playingSentenceIndex] || null;
+        const hoveredSentence = previousSentences[state.hoveredSentenceIndex] || null;
+        const nextSentences = [];
+
+        state.pageSentencesIndex.clear();
+        const pageNumbers = Array.from(state.pdfSentencesByPage.keys())
+            .map(Number)
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b);
+
+        for (const pageNumber of pageNumbers) {
+            const pageSentences = state.pdfSentencesByPage.get(pageNumber) || [];
+            const indices = [];
+            for (let pageSentenceIndex = 0; pageSentenceIndex < pageSentences.length; pageSentenceIndex++) {
+                const sentence = pageSentences[pageSentenceIndex];
+                if (!sentence) continue;
+                sentence.index = nextSentences.length;
+                sentence.pageNumber = pageNumber;
+                sentence.pageSentenceIndex = pageSentenceIndex;
+                indices.push(sentence.index);
+                nextSentences.push(sentence);
+            }
+            state.pageSentencesIndex.set(pageNumber, indices);
+        }
+
+        state.sentences = nextSentences;
+        const existingIndicesChanged = previousSentences.some((sentence, oldIndex) => {
+            const newIndex = nextSentences.indexOf(sentence);
+            return newIndex >= 0 && newIndex !== oldIndex;
+        });
+        const restoreIndex = (sentence, fallback = -1) => {
+            if (!sentence) return fallback;
+            const index = nextSentences.indexOf(sentence);
+            return index >= 0 ? index : fallback;
+        };
+        if (Number.isFinite(state.currentSentenceIndex)) {
+            state.currentSentenceIndex = restoreIndex(currentSentence, -1);
+        }
+        if (Number.isFinite(state.playingSentenceIndex)) {
+            state.playingSentenceIndex = restoreIndex(playingSentence, -1);
+        }
+        if (Number.isFinite(state.hoveredSentenceIndex)) {
+            state.hoveredSentenceIndex = restoreIndex(hoveredSentence, -1);
+        }
+        if (existingIndicesChanged && state.currentDocumentType === "pdf") {
+            this.app.audioManager?.handleSentenceReindex?.(previousSentences, nextSentences);
+            this.app.ttsQueue?.reset?.();
+            this.app._resetAutoTranslateCache?.();
+            this.app._resetReadTranslationCache?.();
+        }
+        return nextSentences;
+    }
+
+    replacePageSentences(pageNumber, pageSentences) {
+        const { state } = this.app;
+        if (!(state.pdfSentencesByPage instanceof Map)) state.pdfSentencesByPage = new Map();
+        state.pdfSentencesByPage.set(pageNumber, Array.isArray(pageSentences) ? pageSentences : []);
+        this._rebuildPdfSentenceIndex();
+        return state.pdfSentencesByPage.get(pageNumber);
+    }
+
+    async parsePageWords(pageNumber, page, options = {}) {
         const { app } = this;
         const { config, state } = app;
+        const hasExpectedPdf = Object.prototype.hasOwnProperty.call(options, "expectedPdf");
+        const expectedPdf = options.expectedPdf;
+        const isCurrentDocument = () =>
+            (!hasExpectedPdf || state.pdf === expectedPdf) &&
+            (typeof options.isCurrent !== "function" || options.isCurrent());
+        if (!isCurrentDocument()) return [];
         const splitOnEverySemicolon = usesSemicolonPhraseBoundaries(state.phraseSplitVersion);
         const protectParentheses = ignoresParenthesizedPunctuation(state.phraseSplitVersion);
         const abbreviations = ["Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "e.g", "i.e.", "etc", "Fig", "p", "al"];
-        let sentenceIndex = state.sentences.length; // Continue from existing sentences
+        const parsedSentences = [];
 
         const escapeRegExp = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const sentenceEndings = Array.isArray(config.SENTENCE_END)
@@ -121,13 +197,19 @@ export class SentenceParser {
 
         const wordsToProcess = page.pageWords;
         if (!wordsToProcess || wordsToProcess.length === 0) {
-            return;
+            if (!isCurrentDocument()) return [];
+            return this.replacePageSentences(pageNumber, []);
         }
 
         let readableLayoutBoxes = [];
-        if (state.generationEnabled && config.SPLIT_PDF_SENTENCES_ON_LAYOUT_BLOCKS) {
+        if (
+            state.generationEnabled &&
+            !options.skipLayoutDetection &&
+            config.SPLIT_PDF_SENTENCES_ON_LAYOUT_BLOCKS
+        ) {
             try {
                 const regions = await app.getPdfHeaderFooterDetector().getLayoutRegions(pageNumber);
+                if (!isCurrentDocument()) return [];
                 readableLayoutBoxes = Array.isArray(regions?.readableBoxes) ? regions.readableBoxes : [];
             } catch (error) {
                 console.warn(`[SentenceParser] Layout phrase split failed for page ${pageNumber}`, error);
@@ -183,7 +265,8 @@ export class SentenceParser {
             const readableText = initialReadableWords.length ? originalText : "";
             const text = fallbackWords === allWords ? originalText : this.joinWords(fallbackWords);
             const sentence = {
-                index: sentenceIndex++,
+                index: parsedSentences.length,
+                pageSentenceIndex: parsedSentences.length,
                 pageNumber: pageNumber,
                 words: allWords,
                 originalWords: allWords,
@@ -210,11 +293,7 @@ export class SentenceParser {
                 layoutProcessingPromise: null,
                 layoutBlockKey: bufferLayoutBlockKey,
             };
-            state.sentences.push(sentence);
-            if (!state.pageSentencesIndex.has(pageNumber)) {
-                state.pageSentencesIndex.set(pageNumber, []);
-            }
-            state.pageSentencesIndex.get(pageNumber).push(sentence.index);
+            parsedSentences.push(sentence);
             buffer = [];
             bufferLayoutBlockKey = null;
             parenthesisDepth = 0;
@@ -285,6 +364,8 @@ export class SentenceParser {
         }
 
         flush(); // Flush any remaining words
+        if (!isCurrentDocument()) return [];
+        return this.replacePageSentences(pageNumber, parsedSentences);
     }
 
     applyLayoutFilteringToPage(pageNumber) {

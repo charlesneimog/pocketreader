@@ -458,6 +458,15 @@
                 <h2 class="text-xl font-bold text-slate-800 dark:text-slate-200">Settings</h2>
                 <div class="flex items-center gap-2">
                     <button
+                        id="trash-button"
+                        aria-label="Open Trash"
+                        title="Open Trash"
+                        class="p-1 rounded-full text-slate-500 dark:text-slate-400 hover:text-primary dark:hover:text-primary"
+                        type="button"
+                    >
+                        <span class="material-symbols-outlined">delete</span>
+                    </button>
+                    <button
                         id="config-menu-close"
                         aria-label="Close settings"
                         class="p-1 rounded-full text-slate-500 dark:text-slate-400 hover:text-primary dark:hover:text-primary"
@@ -774,6 +783,36 @@
             </nav>
         </div>
 
+        <!-- Local and self-hosted document Trash -->
+        <div id="trash-overlay" class="trash-overlay hidden" aria-hidden="true">
+            <section
+                id="trash-dialog"
+                class="trash-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="trash-title"
+                aria-describedby="trash-status"
+            >
+                <header class="trash-dialog-header">
+                    <div>
+                        <h2 id="trash-title">Trash</h2>
+                        <p>Restore documents or delete them forever.</p>
+                    </div>
+                    <button id="trash-close" class="trash-icon-button" type="button" aria-label="Close Trash">
+                        <span class="material-symbols-outlined">close</span>
+                    </button>
+                </header>
+                <p id="trash-status" class="trash-status" role="status" aria-live="polite"></p>
+                <p id="trash-empty-state" class="trash-empty-state" hidden>No deleted documents.</p>
+                <ul id="trash-list" class="trash-list" aria-label="Deleted documents"></ul>
+                <footer class="trash-dialog-footer">
+                    <button id="trash-empty-button" class="trash-empty-button" type="button" hidden>
+                        Empty Trash
+                    </button>
+                </footer>
+            </section>
+        </div>
+
         <!-- Help Overlay -->
         <div
             id="help-overlay"
@@ -881,7 +920,7 @@
                             </div>
                             <div class="flex items-center gap-2">
                                 <span class="material-symbols-outlined text-sm text-primary">delete</span>
-                                <span>Long-press book card to delete</span>
+                                <span>Long-press book card to move it to Trash</span>
                             </div>
                             <div class="flex items-center gap-2">
                                 <span class="material-symbols-outlined text-sm text-primary">settings</span>
@@ -1062,6 +1101,7 @@
         <!-- Initialize App -->
         <script type="module">
             import { app } from "./src/app.js";
+            import { initTrashDialog } from "./src/modules/ui/trashDialog.js";
 
             window.addEventListener("DOMContentLoaded", async () => {
                 let appInitialized = false;
@@ -1099,6 +1139,8 @@
                 const googleDriveImportBtn = document.getElementById("google-drive-import");
                 const googleDriveImportInput = document.getElementById("google-drive-import-input");
                 const googleDriveStatus = document.getElementById("google-drive-status");
+
+                initTrashDialog({ app });
 
                 const getDefaultServerUrl = () => {
                     try {

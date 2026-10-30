@@ -943,11 +943,15 @@ export class TTSEngine {
         if (!pdf || state.currentDocumentType !== "pdf") return;
 
         let queued = 0;
-        for (let index = fromIndex + 1; index < state.sentences.length && queued < limit; index++) {
+        let currentSentence = state.sentences[fromIndex] || null;
+        while (currentSentence && queued < limit) {
             if (requestId !== this._pdfPhrasePrefetchRequestId || state.pdf !== pdf) return;
 
-            let sentence = state.sentences[index];
-            if (!sentence) continue;
+            const adjacentIndex = await this.app.pdfLoader.getAdjacentSentenceIndex(currentSentence, 1);
+            if (adjacentIndex < 0 || requestId !== this._pdfPhrasePrefetchRequestId || state.pdf !== pdf) return;
+            const sentence = state.sentences[adjacentIndex];
+            if (!sentence) return;
+            currentSentence = sentence;
 
             if (!sentence.layoutProcessed) {
                 await this.app.pdfRenderer.ensureFullPageRendered(sentence.pageNumber);
@@ -955,13 +959,14 @@ export class TTSEngine {
 
                 await this.app.getPdfHeaderFooterDetector().ensureReadabilityForPage(sentence.pageNumber);
                 if (requestId !== this._pdfPhrasePrefetchRequestId || state.pdf !== pdf) return;
-                sentence = state.sentences[index];
             }
 
             if (!sentence?.layoutProcessed || !sentence.isTextToRead) continue;
 
-            this.app.ttsQueue.add(index);
-            this.app.prefetchSentenceTranslationForTTS?.(index);
+            const sentenceIndex = state.sentences.indexOf(sentence);
+            if (sentenceIndex < 0) return;
+            this.app.ttsQueue.add(sentenceIndex);
+            this.app.prefetchSentenceTranslationForTTS?.(sentenceIndex);
             queued += 1;
             await cooperativeYield();
         }

@@ -7,6 +7,13 @@ export class StateManager {
         this.viewportDisplayByPage = new Map();
         this.fullPageRenderCache = new Map();
         this.sentences = [];
+        // PDF text is extracted a page at a time. These page-local collections
+        // are the stable source of truth; `sentences` remains the flat,
+        // document-ordered compatibility view used by the rest of the reader.
+        this.pdfSentencesByPage = new Map();
+        this.parsedPdfPages = new Set();
+        this.pdfPageParsePromises = new Map();
+        this.currentPdfPage = 1;
         this.currentSentenceIndex = -1;
         this.playingSentenceIndex = -1;
         this.deviceScale = window.devicePixelRatio || 1;

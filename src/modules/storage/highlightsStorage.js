@@ -143,6 +143,9 @@ export class HighlightsStorage {
         }
         return highlights;
     }
+    ensurePdfWordAnchors(highlights) {
+        return this._stampPdfWordAnchors(highlights);
+    }
     _serializePdfHighlights(highlights) {
         const pages = {};
         for (const [sentenceIndex, original] of highlights.entries()) {

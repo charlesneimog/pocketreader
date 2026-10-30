@@ -29,7 +29,7 @@ test("persists the current and total PDF pages with the reading position", () =>
         state: {
             sentences: [{ pageNumber: 7 }],
             currentSentenceIndex: 0,
-            currentSentence: { pageNumber: 7 },
+            currentSentence: { pageNumber: 7, pageSentenceIndex: 3 },
             currentDocumentType: "pdf",
             currentPdfKey: "book.pdf",
             currentPiperVoice: "voice",
@@ -42,5 +42,20 @@ test("persists the current and total PDF pages with the reading position", () =>
 
     const saved = JSON.parse(values.get("test-progress"))["pdf::book.pdf"];
     assert.equal(saved.currentPage, 7);
+    assert.equal(saved.pageSentenceIndex, 3);
     assert.equal(saved.totalPages, 20);
+});
+
+test("syncs a lazy PDF sentence index only when all preceding pages are parsed", () => {
+    const manager = new ProgressManager({
+        state: {
+            currentDocumentType: "pdf",
+            currentSentence: { pageNumber: 3 },
+            parsedPdfPages: new Set([2, 3]),
+        },
+    });
+
+    assert.equal(manager.canSyncCurrentPosition(), false);
+    manager.app.state.parsedPdfPages.add(1);
+    assert.equal(manager.canSyncCurrentPosition(), true);
 });

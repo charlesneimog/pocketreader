@@ -543,6 +543,72 @@ export class GoogleDriveSync {
         }
     }
 
+    async restoreFile({ fileId, filename, format = "pdf", title = "", document = null, progressEntries = {} } = {}) {
+        if (!this.isEnabled()) {
+            throw new Error("Reconnect Google Drive before restoring this document");
+        }
+        if (!fileId) throw new Error("A document id is required for Google Drive restore");
+
+        const normalizedFormat = format === "epub" ? "epub" : "pdf";
+        const actualFilename = String(filename || this._actualFilename(fileId)).trim() || this._actualFilename(fileId);
+        await this._loadIndex({ force: true });
+
+        let record = this.records.get(fileId) || null;
+        if (!record) {
+            record = [...this.records.values()].find(
+                (item) => item.actualFilename === actualFilename && item.format === normalizedFormat,
+            ) || null;
+        }
+
+        let storedDocument = document;
+        if (!storedDocument) {
+            const keys = normalizedFormat === "epub"
+                ? await this.app.progressManager.listSavedEPUBs()
+                : await this.app.progressManager.listSavedPDFs();
+            const matchingKey = keys.find((key) => this._actualFilename(key) === actualFilename);
+            if (matchingKey) {
+                storedDocument = normalizedFormat === "epub"
+                    ? await this.app.progressManager.loadEpubFromIndexedDB(matchingKey)
+                    : await this.app.progressManager.loadPdfFromIndexedDB(matchingKey);
+            }
+        }
+
+        const blob = storedDocument?.blob || storedDocument;
+        if (!(blob instanceof Blob)) throw new Error("The restored document data is not available on this device");
+
+        this.app.ui?.showInfo?.(`Google Drive: restoring ${actualFilename}...`);
+        const uploaded = await this._createContentFile({
+            name: actualFilename,
+            parents: [await this._ensureFolder()],
+            appProperties: { pocketReaderKind: "document", pocketReaderVersion: "1" },
+        }, blob);
+
+        const previousFileId = record?.fileId;
+        const progress = progressEntries[`${normalizedFormat}::${fileId}`] || progressEntries[fileId] || null;
+        const now = new Date().toISOString();
+        record = {
+            ...(record || {}),
+            version: 1,
+            fileId,
+            actualFilename,
+            format: normalizedFormat,
+            title: String(title || record?.title || progress?.title || actualFilename),
+            position: Number.isFinite(Number(progress?.sentenceIndex))
+                ? Number(progress.sentenceIndex)
+                : (record?.position ?? 0),
+            voice: progress?.voice || record?.voice || null,
+            documentDriveId: uploaded.id,
+            deleted: false,
+            updatedAt: now,
+            createdAt: record?.createdAt || now,
+        };
+        delete record.deletedAt;
+        if (previousFileId && previousFileId !== fileId) this.records.delete(previousFileId);
+        await this._saveRecord(record);
+        this.app.ui?.showInfo?.(`Google Drive: restored ${actualFilename}`);
+        return true;
+    }
+
     async pullServerStateUpdates() { return await this.syncFromServer(); }
     async syncFromServer({ showProgress = true } = {}) {
         if (!this.isEnabled()) return false;
@@ -572,15 +638,23 @@ export class GoogleDriveSync {
                     : await this.app.progressManager.loadPdfFromIndexedDB(fileId);
                 const hadLocalCopy = !!stored || Object.hasOwn(progressMap, compoundKey);
                 if (showProgress && hadLocalCopy) this.app.ui?.showInfo?.(`Google Drive: removing local copy — ${name}`);
-                if (format === "epub") {
-                    this.app.progressManager.clearEpubProgress(fileId);
-                    await this.app.progressManager.removeEpubFromIndexedDB(fileId);
+                if (stored) {
+                    try {
+                        await this.app.progressManager.moveDocumentToTrash(fileId, format, {
+                            filename: name,
+                            title: record.title || name,
+                            googleDriveBacked: true,
+                        });
+                    } catch (error) {
+                        console.warn("[GoogleDriveSync] Could not move deleted local copy to Trash", error);
+                        continue;
+                    }
                 } else {
-                    this.app.progressManager.clearPdfProgress(fileId);
-                    await this.app.progressManager.removePdfFromIndexedDB(fileId);
+                    this.app.progressManager.clearDocumentProgress(format, fileId);
+                    this.app.highlightsStorage?.clearPdfHighlights?.(fileId);
                 }
-                this.app.highlightsStorage?.clearPdfHighlights?.(fileId);
                 delete progressMap[compoundKey];
+                if (format === "pdf") delete progressMap[fileId];
                 if (hadLocalCopy) removedCount++;
                 continue;
             }
@@ -629,7 +703,9 @@ export class GoogleDriveSync {
             if (!(await this.ensureFileOnServer())) return false;
             const state = this.app.state;
             const fileId = state.currentDocumentType === "epub" ? state.currentEpubKey : state.currentPdfKey;
-            if (state.currentSentenceIndex >= 0) await this.syncPosition(fileId, state.currentSentenceIndex);
+            if (state.currentSentenceIndex >= 0 && this.app.progressManager.canSyncCurrentPosition()) {
+                await this.syncPosition(fileId, state.currentSentenceIndex);
+            }
             if (state.currentPiperVoice) await this.syncVoice(fileId, state.currentPiperVoice);
             await this.syncHighlights(fileId, state.savedHighlights || new Map());
             await this.syncRewards();

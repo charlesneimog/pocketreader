@@ -112,10 +112,16 @@ export class ControlsManager {
             app.state.autoAdvanceActive = false;
             app.ttsQueue.reset();
         };
+        const runNavigation = (operation) => {
+            Promise.resolve(operation).catch((error) => {
+                console.warn("Reader navigation failed", error);
+                app.ui?.showInfo?.(`Unable to navigate: ${error.message}`);
+            });
+        };
 
         // Basic controls
-        on(this.btnNextSentence, "click", () => app.nextSentence(true));
-        on(this.btnPrevSentence, "click", () => app.prevSentence(true));
+        on(this.btnNextSentence, "click", () => runNavigation(app.nextSentence(true)));
+        on(this.btnPrevSentence, "click", () => runNavigation(app.prevSentence(true)));
         on(this.btnPlayToggle, "click", () => app.togglePlay());
         on(this.bntFullScreen, "click", () => this.toggleFullscreen());
 
@@ -129,11 +135,11 @@ export class ControlsManager {
         // Page navigation
         on(this.btnNextPage, "click", () => {
             stopAndResetAudio();
-            app.nextPageNav();
+            runNavigation(app.nextPageNav());
         });
         on(this.btnPrevPage, "click", () => {
             stopAndResetAudio();
-            app.prevPageNav();
+            runNavigation(app.prevPageNav());
         });
 
         // Highlights
@@ -359,8 +365,8 @@ export class ControlsManager {
                         e.preventDefault();
                         app.togglePlay();
                     },
-                    ArrowRight: () => app.nextSentence(true),
-                    ArrowLeft: () => app.prevSentence(true),
+                    ArrowRight: () => runNavigation(app.nextSentence(true)),
+                    ArrowLeft: () => runNavigation(app.prevSentence(true)),
                     KeyH: () => app.saveCurrentSentenceHighlight(),
                     KeyC: async () => {
                         // Don't hijack common browser/system shortcuts like Ctrl+C / Cmd+C.

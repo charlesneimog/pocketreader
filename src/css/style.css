@@ -261,6 +261,211 @@ html.amoled-mode .settings-display-controls button {
     padding-bottom: 0;
 }
 
+.trash-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10060;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.75rem;
+    background: rgba(15, 23, 42, 0.58);
+    backdrop-filter: blur(5px);
+}
+
+.trash-overlay.hidden {
+    display: none;
+}
+
+.trash-dialog {
+    width: min(32rem, calc(100vw - 1.5rem));
+    max-height: min(42rem, calc(100vh - 1.5rem));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    color: #1e293b;
+    background: rgba(248, 250, 252, 0.98);
+    border: 1px solid rgba(148, 163, 184, 0.42);
+    border-radius: 0.75rem;
+    box-shadow: 0 24px 60px rgba(15, 23, 42, 0.34);
+}
+
+.trash-dialog-header,
+.trash-dialog-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem;
+}
+
+.trash-dialog-header {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.trash-dialog-header h2 {
+    margin: 0;
+    font-size: 1.125rem;
+    font-weight: 700;
+}
+
+.trash-dialog-header p,
+.trash-status,
+.trash-empty-state,
+.trash-item-metadata {
+    color: #64748b;
+}
+
+.trash-dialog-header p {
+    margin: 0.2rem 0 0;
+    font-size: 0.75rem;
+}
+
+.trash-icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 2.25rem;
+    height: 2.25rem;
+    color: #64748b;
+    border-radius: 999px;
+}
+
+.trash-icon-button:hover,
+.trash-icon-button:focus-visible {
+    color: var(--color-primary);
+    background: rgba(148, 163, 184, 0.16);
+}
+
+.trash-status,
+.trash-empty-state {
+    margin: 0;
+    padding: 0.75rem 1rem 0;
+    font-size: 0.75rem;
+}
+
+.trash-status-error {
+    color: #b91c1c;
+}
+
+.trash-empty-state {
+    padding: 2rem 1rem;
+    text-align: center;
+}
+
+.trash-list {
+    min-height: 0;
+    margin: 0;
+    padding: 0.75rem 1rem;
+    overflow-y: auto;
+    list-style: none;
+}
+
+.trash-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.trash-item:last-child {
+    border-bottom: 0;
+}
+
+.trash-item-details {
+    min-width: 0;
+}
+
+.trash-item-title {
+    margin: 0;
+    overflow: hidden;
+    font-size: 0.875rem;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.trash-item-metadata {
+    margin: 0.25rem 0 0;
+    font-size: 0.6875rem;
+}
+
+.trash-item-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 0.4rem;
+}
+
+.trash-action,
+.trash-empty-button {
+    min-height: 2.25rem;
+    padding: 0.45rem 0.65rem;
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border: 1px solid rgba(100, 116, 139, 0.35);
+    border-radius: 0.5rem;
+}
+
+.trash-action:disabled,
+.trash-empty-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.trash-action-restore {
+    color: var(--color-primary);
+}
+
+.trash-action-delete,
+.trash-empty-button {
+    color: #b91c1c;
+}
+
+.trash-dialog-footer {
+    justify-content: flex-end;
+    padding-top: 0.75rem;
+    border-top: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+@media (max-width: 520px) {
+    .trash-item {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    .trash-dialog {
+        color: #e2e8f0;
+        background: rgba(31, 41, 55, 0.98);
+        border-color: rgba(100, 116, 139, 0.55);
+    }
+
+    .trash-dialog-header p,
+    .trash-status,
+    .trash-empty-state,
+    .trash-item-metadata,
+    .trash-icon-button {
+        color: #94a3b8;
+    }
+
+    .trash-status-error,
+    .trash-action-delete,
+    .trash-empty-button {
+        color: #fca5a5;
+    }
+}
+
+html.amoled-mode .trash-dialog {
+    color: var(--amoled-reader-fg);
+    background: #000;
+    border-color: rgba(255, 255, 255, 0.18);
+}
+
 .settings-email-hint:has(~ :not([hidden])) {
     display: none;
 }

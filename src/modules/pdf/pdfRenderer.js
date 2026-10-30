@@ -25,7 +25,10 @@ export class PDFRenderer {
         this.app = app;
         this.pageCoordinateSystems = new Map();
         this._pageRenderPromises = new Map();
+        this._renderedPdf = null;
         this._fullDocumentObserver = null;
+        this._nearbyPageWrappers = new Set();
+        this._pageTextFocusTimer = null;
         this._activePhraseActionsEl = null;
         this._boundAmoledModeChange = () => {
             this.refreshAmoledRendering().catch((error) => {
@@ -115,6 +118,34 @@ export class PDFRenderer {
         state.fullPageRenderCache.clear();
     }
 
+    disconnectFullDocumentObserver() {
+        this._fullDocumentObserver?.disconnect();
+        this._fullDocumentObserver = null;
+        this._nearbyPageWrappers.clear();
+        if (this._pageTextFocusTimer) {
+            clearTimeout(this._pageTextFocusTimer);
+            this._pageTextFocusTimer = null;
+        }
+    }
+
+    _scheduleFocusedPageTextParsing(pageNumber, wrapper) {
+        if (this._pageTextFocusTimer) clearTimeout(this._pageTextFocusTimer);
+        this._pageTextFocusTimer = setTimeout(() => {
+            this._pageTextFocusTimer = null;
+            if (!wrapper?.isConnected || this.app.state.currentPdfPage !== pageNumber) return;
+            this.app.pdfLoader
+                ?.ensurePageParsed?.(pageNumber, { prefetchNext: true })
+                .then(() => {
+                    if (!wrapper.isConnected) return;
+                    this.updateHighlightDisplay();
+                    this.app.interactionHandler?.setupInteractionListeners?.();
+                })
+                .catch((error) => {
+                    console.warn(`[PDFRenderer] Text extraction failed for page ${pageNumber}`, error);
+                });
+        }, 250);
+    }
+
     _getAmoledTextColor() {
         try {
             return AMOLED_TEXT_COLORS[this._getAmoledTextLevel()];
@@ -183,9 +214,11 @@ export class PDFRenderer {
         }
 
         if (!state.pdf) return null;
+        const pdfDocument = state.pdf;
 
         try {
-            const page = state.pagesCache.get(pageNumber) || (await state.pdf.getPage(pageNumber));
+            const page = state.pagesCache.get(pageNumber) || (await pdfDocument.getPage(pageNumber));
+            if (state.pdf !== pdfDocument) return null;
             if (page && !state.pagesCache.has(pageNumber)) state.pagesCache.set(pageNumber, page);
 
             const unscaled = page.getViewport({ scale: 1 });
@@ -200,6 +233,7 @@ export class PDFRenderer {
             page.baseDisplayScale = displayScale;
             page.currentDisplayScale = displayScale;
 
+            if (state.pdf !== pdfDocument) return null;
             state.viewportDisplayByPage.set(pageNumber, viewportDisplay);
             return viewportDisplay;
         } catch {
@@ -599,27 +633,37 @@ export class PDFRenderer {
     async findNextReadableSentenceForward(startIdx, visited) {
         const { state } = this.app;
         const seen = visited ?? new Set();
-        for (let i = startIdx + 1; i < state.sentences.length; i++) {
-            if (seen.has(i)) continue;
+        let current = state.sentences[startIdx];
+        while (current) {
+            const i = await this.app.pdfLoader.getAdjacentSentenceIndex(current, 1);
+            if (i < 0) return -1;
             let candidate = state.sentences[i];
-            if (!candidate) continue;
+            if (!candidate || seen.has(candidate)) return -1;
 
             if (state.generationEnabled && !candidate.layoutProcessed) {
                 await this.app.getPdfHeaderFooterDetector().ensureReadabilityForPage(candidate.pageNumber);
-                candidate = state.sentences[i];
             }
+            const candidateIndex = state.sentences.indexOf(candidate);
+            if (candidateIndex < 0) return -1;
 
             if (!state.generationEnabled || candidate.isTextToRead) {
-                return i;
+                return candidateIndex;
             }
 
-            seen.add(i);
+            seen.add(candidate);
+            current = candidate;
         }
         return -1;
     }
 
     async ensureFullPageRendered(pageNumber) {
         const { state } = this.app;
+        const pdfDocument = state.pdf;
+        if (!pdfDocument) throw new Error("No PDF is loaded");
+        if (this._renderedPdf !== pdfDocument) {
+            this.clearRenderedPageCache();
+            this._renderedPdf = pdfDocument;
+        }
         if (state.fullPageRenderCache.has(pageNumber)) {
             const cached = state.fullPageRenderCache.get(pageNumber);
             // Refresh insertion order so eviction behaves as an LRU cache.
@@ -627,10 +671,12 @@ export class PDFRenderer {
             state.fullPageRenderCache.set(pageNumber, cached);
             return cached;
         }
-        if (this._pageRenderPromises.has(pageNumber)) return this._pageRenderPromises.get(pageNumber);
+        const pending = this._pageRenderPromises.get(pageNumber);
+        if (pending?.pdfDocument === pdfDocument) return pending.promise;
 
         const renderPromise = (async () => {
-            const page = state.pagesCache.get(pageNumber) || (await state.pdf.getPage(pageNumber));
+            const page = state.pagesCache.get(pageNumber) || (await pdfDocument.getPage(pageNumber));
+            if (state.pdf !== pdfDocument) throw new Error("PDF document changed during page render");
             const viewportDisplay = state.viewportDisplayByPage.get(pageNumber);
             if (!viewportDisplay) throw new Error(`Missing viewport for PDF page ${pageNumber}`);
             const deviceScale = this._getRenderDeviceScale(viewportDisplay);
@@ -643,15 +689,20 @@ export class PDFRenderer {
             off.height = fullH;
             const offCtx = off.getContext("2d");
             await page.render({ canvasContext: offCtx, viewport: viewportRender, ...this._getRenderOptions() }).promise;
+            if (state.pdf !== pdfDocument) {
+                this.releaseCanvas(off);
+                throw new Error("PDF document changed during page render");
+            }
             this._cacheFullPageCanvas(pageNumber, off);
             return off;
         })();
 
-        this._pageRenderPromises.set(pageNumber, renderPromise);
+        const renderEntry = { pdfDocument, promise: renderPromise };
+        this._pageRenderPromises.set(pageNumber, renderEntry);
         try {
             return await renderPromise;
         } finally {
-            if (this._pageRenderPromises.get(pageNumber) === renderPromise) {
+            if (this._pageRenderPromises.get(pageNumber) === renderEntry) {
                 this._pageRenderPromises.delete(pageNumber);
             }
         }
@@ -663,11 +714,45 @@ export class PDFRenderer {
 
         const container = document.getElementById("pdf-doc-container");
         if (!container) return;
-        this._fullDocumentObserver?.disconnect();
+        this.disconnectFullDocumentObserver();
         container.innerHTML = "";
 
         const observer = new IntersectionObserver(
             async (entries) => {
+                for (const entry of entries) {
+                    if (entry.isIntersecting) this._nearbyPageWrappers.add(entry.target);
+                    else this._nearbyPageWrappers.delete(entry.target);
+                }
+                if (state.currentSentenceIndex >= 0) {
+                    const viewportRect = container.getBoundingClientRect();
+                    let focusedWrapper = null;
+                    let largestVisibleArea = 0;
+                    for (const candidate of this._nearbyPageWrappers) {
+                        if (!candidate.isConnected) {
+                            this._nearbyPageWrappers.delete(candidate);
+                            continue;
+                        }
+                        const rect = candidate.getBoundingClientRect();
+                        const visibleWidth = Math.max(
+                            0,
+                            Math.min(rect.right, viewportRect.right) - Math.max(rect.left, viewportRect.left),
+                        );
+                        const visibleHeight = Math.max(
+                            0,
+                            Math.min(rect.bottom, viewportRect.bottom) - Math.max(rect.top, viewportRect.top),
+                        );
+                        const visibleArea = visibleWidth * visibleHeight;
+                        if (visibleArea > largestVisibleArea) {
+                            largestVisibleArea = visibleArea;
+                            focusedWrapper = candidate;
+                        }
+                    }
+                    const focusedPage = Number.parseInt(focusedWrapper?.dataset?.pageNumber, 10);
+                    if (Number.isFinite(focusedPage)) {
+                        state.currentPdfPage = focusedPage;
+                        this._scheduleFocusedPageTextParsing(focusedPage, focusedWrapper);
+                    }
+                }
                 for (const entry of entries) {
                     const pageNumber = parseInt(entry.target.dataset.pageNumber, 10);
                     const wrapper = entry.target;
@@ -691,6 +776,7 @@ export class PDFRenderer {
                                 fullPageCanvas.style.width = "100%";
                                 fullPageCanvas.style.height = "100%";
                                 wrapper.insertBefore(fullPageCanvas, wrapper.firstChild);
+                                this.updateHighlightDisplay();
                             }
                         }, this.app.config.MS_ON_FOCUS_TO_RENDER);
                     } else {
@@ -1000,6 +1086,21 @@ export class PDFRenderer {
         const targetY = wrapperTop + bbox.y * scaleY - this.app.config.SCROLL_MARGIN;
         const maxScroll = container.scrollHeight - container.clientHeight;
         container.scrollTo({ top: clamp(targetY, 0, maxScroll), behavior: "smooth" });
+    }
+
+    async renderPage(pageNumber) {
+        const { state } = this.app;
+        if (!state.pdf || pageNumber < 1 || pageNumber > state.pdf.numPages) return;
+        const pdfDocument = state.pdf;
+        state.currentPdfPage = pageNumber;
+        await this.app.pdfLoader.ensurePageParsed(pageNumber, { prefetchNext: true });
+        if (state.pdf !== pdfDocument) return;
+        await this.ensurePageCanvasMounted(pageNumber);
+        if (state.pdf !== pdfDocument) return;
+        const container = document.getElementById("pdf-doc-container");
+        const wrapper = container?.querySelector?.(`.pdf-page-wrapper[data-page-number="${pageNumber}"]`);
+        wrapper?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+        this.updateHighlightDisplay();
     }
 
     // Recompute and cache sentence bbox from current scaled words if existing bbox is stale or missing
@@ -1661,11 +1762,11 @@ export class PDFRenderer {
         const visited = options.visited ?? new Set();
 
         if (idx < 0 || idx >= state.sentences.length) return;
-        if (visited.has(idx)) return;
-        visited.add(idx);
-
         let sentence = state.sentences[idx];
         if (!sentence) return;
+        if (visited.has(sentence)) return;
+        visited.add(sentence);
+        const targetSentence = sentence;
 
         const pageNumber = sentence.pageNumber;
         const pdfCanvas = document.getElementById("pdf-canvas");
@@ -1673,7 +1774,9 @@ export class PDFRenderer {
 
         if (state.generationEnabled && !sentence.layoutProcessed) {
             await this.app.getPdfHeaderFooterDetector().ensureReadabilityForPage(pageNumber);
-            sentence = state.sentences[idx];
+            idx = state.sentences.indexOf(targetSentence);
+            if (idx < 0) return;
+            sentence = targetSentence;
         }
 
         if (state.generationEnabled && !sentence.isTextToRead && autoAdvance) {
@@ -1684,7 +1787,8 @@ export class PDFRenderer {
         }
 
         state.currentSentenceIndex = idx;
-        sentence = state.sentences[idx];
+        state.currentPdfPage = sentence.pageNumber;
+        void this.app.pdfLoader?.prefetchNextPage?.(sentence.pageNumber);
 
         // Calibrar sistema de coordenadas
         if (!this.pageCoordinateSystems.has(sentence.pageNumber)) {
@@ -1697,6 +1801,9 @@ export class PDFRenderer {
         // --- Renderização segura da página atual ---
         if (pdfDocContainer) {
             await this.ensurePageCanvasMounted(sentence.pageNumber);
+            idx = state.sentences.indexOf(sentence);
+            if (idx < 0) return;
+            state.currentSentenceIndex = idx;
         }
 
         // Atualizar destaques e scroll

@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import os
 import time
@@ -12,6 +13,17 @@ import json
 DB_PATH = "data/database.db"
 
 logger = logging.getLogger("localreader.app")
+
+
+@contextmanager
+def _db_connection(timeout: float = 30):
+    """Open a transactional SQLite connection and always close it."""
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 class FileDeletedError(RuntimeError):
@@ -63,13 +75,18 @@ def _resolve_canonical_filename(file_id: str, owner_email: str | None) -> str | 
     requested_norm = _normalize_text_key(requested_raw)
     actual_norm = _extract_actual_filename(requested_norm if requested_norm.startswith("file::") else requested_raw)
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.cursor()
 
         # 1) exact match (raw, then normalized)
         if owner_n:
             cursor.execute(
-                "SELECT filename FROM files WHERE filename = ? AND owner_email = ? LIMIT 1",
+                """
+                SELECT filename
+                FROM files
+                WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
+                LIMIT 1
+                """,
                 (requested_raw, owner_n),
             )
             row = cursor.fetchone()
@@ -77,7 +94,12 @@ def _resolve_canonical_filename(file_id: str, owner_email: str | None) -> str | 
                 return row[0]
             if requested_norm and requested_norm != requested_raw:
                 cursor.execute(
-                    "SELECT filename FROM files WHERE filename = ? AND owner_email = ? LIMIT 1",
+                    """
+                    SELECT filename
+                    FROM files
+                    WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
+                    LIMIT 1
+                    """,
                     (requested_norm, owner_n),
                 )
                 row = cursor.fetchone()
@@ -85,7 +107,7 @@ def _resolve_canonical_filename(file_id: str, owner_email: str | None) -> str | 
                     return row[0]
         else:
             cursor.execute(
-                "SELECT filename FROM files WHERE filename = ? LIMIT 1",
+                "SELECT filename FROM files WHERE filename = ? AND deleted_at IS NULL LIMIT 1",
                 (requested_raw,),
             )
             row = cursor.fetchone()
@@ -93,7 +115,7 @@ def _resolve_canonical_filename(file_id: str, owner_email: str | None) -> str | 
                 return row[0]
             if requested_norm and requested_norm != requested_raw:
                 cursor.execute(
-                    "SELECT filename FROM files WHERE filename = ? LIMIT 1",
+                    "SELECT filename FROM files WHERE filename = ? AND deleted_at IS NULL LIMIT 1",
                     (requested_norm,),
                 )
                 row = cursor.fetchone()
@@ -107,7 +129,7 @@ def _resolve_canonical_filename(file_id: str, owner_email: str | None) -> str | 
                     """
                     SELECT filename
                     FROM files
-                    WHERE owner_email = ? AND actual_filename = ?
+                    WHERE owner_email = ? AND actual_filename = ? AND deleted_at IS NULL
                     ORDER BY COALESCE(updated_at, created_at) DESC
                     LIMIT 1
                     """,
@@ -118,7 +140,7 @@ def _resolve_canonical_filename(file_id: str, owner_email: str | None) -> str | 
                     """
                     SELECT filename
                     FROM files
-                    WHERE actual_filename = ?
+                    WHERE actual_filename = ? AND deleted_at IS NULL
                     ORDER BY COALESCE(updated_at, created_at) DESC
                     LIMIT 1
                     """,
@@ -265,6 +287,7 @@ def init_db():
     _ensure_column("files", "translation_updated_at", "TEXT")
     _ensure_column("files", "owner_email", "TEXT")
     _ensure_column("files", "actual_filename", "TEXT")
+    _ensure_column("files", "deleted_at", "TEXT")
 
     _ensure_column("highlights", "owner_email", "TEXT")
     _ensure_column("highlights", "comment", "TEXT")
@@ -370,7 +393,7 @@ def _is_actual_filename_deleted(actual_filename: str, owner_email: str | None) -
     actual = _normalize_text_key(actual_filename or "")
     if not actual:
         return False
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT 1 FROM deleted_files WHERE owner_email = ? AND actual_filename = ?",
@@ -383,7 +406,7 @@ def get_deleted_files(owner_email: str | None = None):
     owner_n = _normalize_email(owner_email) if owner_email else None
     if not owner_n:
         return []
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
@@ -397,6 +420,55 @@ def get_deleted_files(owner_email: str | None = None):
         )
         rows = cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+def get_trashed_files(owner_email: str | None = None):
+    """Return recoverable files in an owner's trash.
+
+    Multiple sync identifiers can refer to the same underlying document, so this
+    returns only the newest variant for each normalized actual filename.
+    """
+    owner_n = _normalize_email(owner_email) if owner_email else None
+    if not owner_n:
+        return []
+
+    with _db_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                actual_filename,
+                title,
+                format,
+                deleted_at,
+                LENGTH(file_data) AS size
+            FROM files
+            WHERE owner_email = ? AND deleted_at IS NOT NULL
+            ORDER BY deleted_at DESC, COALESCE(updated_at, created_at) DESC, id DESC
+            """,
+            (owner_n,),
+        )
+        rows = cursor.fetchall()
+
+    files = []
+    seen = set()
+    for row in rows:
+        actual = _normalize_text_key(row["actual_filename"] or "")
+        if not actual or actual in seen:
+            continue
+        seen.add(actual)
+        files.append(
+            {
+                "file_id": actual,
+                "filename": actual,
+                "title": row["title"] or actual,
+                "format": row["format"],
+                "deleted_at": row["deleted_at"],
+                "size": row["size"] or 0,
+            }
+        )
+    return files
 
 
 def is_file_deleted(file_id: str, owner_email: str | None = None) -> bool:
@@ -426,28 +498,18 @@ def mark_file_deleted(file_id: str, owner_email: str | None = None) -> bool:
 
     for attempt in range(4):
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _db_connection() as conn:
                 cursor = conn.cursor()
 
-                # Resolve all stored variants for this document.
+                # Keep the payload and highlights recoverable, while hiding all
+                # sync variants of this document from active file APIs.
                 cursor.execute(
-                    "SELECT filename FROM files WHERE owner_email = ? AND actual_filename = ?",
-                    (owner_n, actual),
-                )
-                filenames = [r[0] for r in cursor.fetchall()]
-
-                # Delete highlights for each filename variant.
-                for fn in filenames:
-                    scoped_file_id = f"{owner_n}::{fn}"
-                    cursor.execute(
-                        "DELETE FROM highlights WHERE owner_email = ? AND file_id = ?",
-                        (owner_n, scoped_file_id),
-                    )
-
-                # Delete file variants.
-                cursor.execute(
-                    "DELETE FROM files WHERE owner_email = ? AND actual_filename = ?",
-                    (owner_n, actual),
+                    """
+                    UPDATE files
+                    SET deleted_at = ?
+                    WHERE owner_email = ? AND actual_filename = ?
+                    """,
+                    (now, owner_n, actual),
                 )
 
                 # Insert/update tombstone.
@@ -465,6 +527,183 @@ def mark_file_deleted(file_id: str, owner_email: str | None = None) -> bool:
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower() and attempt < 3:
                 logger.warning("DB locked on delete (attempt %d): owner=%s actual=%s", attempt + 1, owner_n, actual)
+                _sleep_on_lock(attempt)
+                continue
+            raise
+
+
+def restore_file_from_trash(file_id: str, owner_email: str | None = None) -> bool:
+    """Restore all stored variants of a trashed document for one owner."""
+    owner_n = _normalize_email(owner_email) if owner_email else None
+    target = _normalize_text_key((file_id or "").strip())
+    actual = _extract_actual_filename(target)
+    if not owner_n or not actual:
+        return False
+
+    now = datetime.utcnow().isoformat()
+    for attempt in range(4):
+        try:
+            with _db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE files
+                    SET deleted_at = NULL, updated_at = ?
+                    WHERE owner_email = ?
+                      AND actual_filename = ?
+                      AND deleted_at IS NOT NULL
+                    """,
+                    (now, owner_n, actual),
+                )
+                restored = cursor.rowcount > 0
+                # A tombstone can outlive its payload (legacy hard deletes or a
+                # delete initiated by a client whose file was never uploaded).
+                # Clearing it is still a successful restore because it permits
+                # that client's local copy to upload again.
+                cursor.execute(
+                    "DELETE FROM deleted_files WHERE owner_email = ? AND actual_filename = ?",
+                    (owner_n, actual),
+                )
+                cleared_tombstone = cursor.rowcount > 0
+            return restored or cleared_tombstone
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 3:
+                logger.warning(
+                    "DB locked on trash restore (attempt %d): owner=%s actual=%s",
+                    attempt + 1,
+                    owner_n,
+                    actual,
+                )
+                _sleep_on_lock(attempt)
+                continue
+            raise
+
+
+def purge_trashed_file(file_id: str, owner_email: str | None = None) -> bool:
+    """Permanently remove one trash payload while retaining its sync tombstone."""
+    owner_n = _normalize_email(owner_email) if owner_email else None
+    target = _normalize_text_key((file_id or "").strip())
+    actual = _extract_actual_filename(target)
+    if not owner_n or not actual:
+        return False
+
+    for attempt in range(4):
+        try:
+            with _db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute(
+                    """
+                    SELECT filename, deleted_at
+                    FROM files
+                    WHERE owner_email = ?
+                      AND actual_filename = ?
+                      AND deleted_at IS NOT NULL
+                    """,
+                    (owner_n, actual),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    return False
+
+                filenames = [row[0] for row in rows]
+                deleted_at = max(row[1] for row in rows)
+                cursor.execute(
+                    """
+                    INSERT INTO deleted_files (owner_email, actual_filename, deleted_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(owner_email, actual_filename)
+                    DO UPDATE SET deleted_at = excluded.deleted_at
+                    """,
+                    (owner_n, actual, deleted_at),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM files
+                    WHERE owner_email = ?
+                      AND actual_filename = ?
+                      AND deleted_at IS NOT NULL
+                    """,
+                    (owner_n, actual),
+                )
+                if cursor.rowcount != len(rows):
+                    raise RuntimeError("Trash changed while permanently deleting file")
+
+                for filename in filenames:
+                    cursor.execute(
+                        "DELETE FROM highlights WHERE owner_email = ? AND file_id = ?",
+                        (owner_n, f"{owner_n}::{filename}"),
+                    )
+            return True
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 3:
+                logger.warning(
+                    "DB locked on trash purge (attempt %d): owner=%s actual=%s",
+                    attempt + 1,
+                    owner_n,
+                    actual,
+                )
+                _sleep_on_lock(attempt)
+                continue
+            raise
+
+
+def empty_trash(owner_email: str | None = None) -> int:
+    """Permanently remove every recoverable trash payload for one owner.
+
+    Tombstones intentionally remain so an older client cannot upload a deleted
+    local copy and resurrect it without an explicit restore.
+    """
+    owner_n = _normalize_email(owner_email) if owner_email else None
+    if not owner_n:
+        return 0
+
+    for attempt in range(4):
+        try:
+            with _db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute(
+                    """
+                    SELECT filename, actual_filename, deleted_at
+                    FROM files
+                    WHERE owner_email = ? AND deleted_at IS NOT NULL
+                    """,
+                    (owner_n,),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    return 0
+
+                actual_filenames = set()
+                for filename, actual_filename, deleted_at in rows:
+                    actual = _normalize_text_key(actual_filename or "")
+                    if actual:
+                        actual_filenames.add(actual)
+                        cursor.execute(
+                            """
+                            INSERT INTO deleted_files (owner_email, actual_filename, deleted_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(owner_email, actual_filename) DO NOTHING
+                            """,
+                            (owner_n, actual, deleted_at),
+                        )
+                cursor.execute(
+                    "DELETE FROM files WHERE owner_email = ? AND deleted_at IS NOT NULL",
+                    (owner_n,),
+                )
+                if cursor.rowcount != len(rows):
+                    raise RuntimeError("Trash changed while emptying it")
+
+                for filename, _actual_filename, _deleted_at in rows:
+                    cursor.execute(
+                        "DELETE FROM highlights WHERE owner_email = ? AND file_id = ?",
+                        (owner_n, f"{owner_n}::{filename}"),
+                    )
+            return len(actual_filenames)
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 3:
+                logger.warning("DB locked on empty trash (attempt %d): owner=%s", attempt + 1, owner_n)
                 _sleep_on_lock(attempt)
                 continue
             raise
@@ -498,7 +737,7 @@ def create_user(email: str, password: str) -> bool:
     pw_hash = _hash_password(password, salt_hex)
 
     try:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with _db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -519,7 +758,7 @@ def verify_user(email: str, password: str) -> bool:
     if not email_n or not isinstance(password, str):
         return False
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT password_hash, password_salt FROM users WHERE email = ?", (email_n,))
         row = cursor.fetchone()
@@ -546,7 +785,7 @@ def set_user_password(email: str, new_password: str) -> bool:
     salt_hex = secrets.token_bytes(16).hex()
     pw_hash = _hash_password(new_password, salt_hex)
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -565,7 +804,7 @@ def user_exists(email: str) -> bool:
     email_n = _normalize_email(email)
     if not email_n:
         return False
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM users WHERE email = ?", (email_n,))
         return cursor.fetchone() is not None
@@ -579,7 +818,7 @@ def create_password_reset(email: str, token_plain: str, expires_at_iso: str) -> 
     now = datetime.utcnow().isoformat()
 
     try:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with _db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -604,7 +843,7 @@ def consume_password_reset(email: str, token_plain: str) -> bool:
     token_hash = hashlib.sha256(token_plain.encode("utf-8")).hexdigest()
     now = datetime.utcnow().isoformat()
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -752,7 +991,7 @@ def get_files(owner_email=None):
                 COALESCE(voice_updated_at, created_at) AS voice_updated_at,
                 COALESCE(translation_updated_at, created_at) AS translation_updated_at
             FROM files
-            WHERE owner_email = ?
+            WHERE owner_email = ? AND deleted_at IS NULL
             ORDER BY created_at DESC
             """,
             (owner_n,),
@@ -770,6 +1009,7 @@ def get_files(owner_email=None):
                 COALESCE(voice_updated_at, created_at) AS voice_updated_at,
                 COALESCE(translation_updated_at, created_at) AS translation_updated_at
             FROM files
+            WHERE deleted_at IS NULL
             ORDER BY created_at DESC
             """
         )
@@ -805,12 +1045,16 @@ def get_file_blob(file_id, owner_email=None):
     cursor = conn.cursor()
     if owner_n:
         cursor.execute(
-            "SELECT file_data FROM files WHERE filename = ? AND owner_email = ?",
+            """
+            SELECT file_data
+            FROM files
+            WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
+            """,
             (canonical, owner_n),
         )
     else:
         cursor.execute(
-            "SELECT file_data FROM files WHERE filename = ?",
+            "SELECT file_data FROM files WHERE filename = ? AND deleted_at IS NULL",
             (canonical,),
         )
     row = cursor.fetchone()
@@ -834,15 +1078,15 @@ def get_file_data(file_id, owner_email=None):
     Returns:
         Dict-like row with metadata, or None.
     """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-
     owner_n = _normalize_email(owner_email) if owner_email else None
     canonical = _resolve_canonical_filename(file_id, owner_n)
     if not canonical:
         logger.debug("get_file_data: owner=%s file_id=%s hit=%s", owner_n or "*", file_id, False)
         return None
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
 
     if owner_n:
         cursor.execute(
@@ -857,7 +1101,7 @@ def get_file_data(file_id, owner_email=None):
                 COALESCE(voice_updated_at, created_at) AS voice_updated_at,
                 COALESCE(translation_updated_at, created_at) AS translation_updated_at
             FROM files
-            WHERE filename = ? AND owner_email = ?
+            WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
             """,
             (canonical, owner_n),
         )
@@ -874,7 +1118,7 @@ def get_file_data(file_id, owner_email=None):
                 COALESCE(voice_updated_at, created_at) AS voice_updated_at,
                 COALESCE(translation_updated_at, created_at) AS translation_updated_at
             FROM files
-            WHERE filename = ?
+            WHERE filename = ? AND deleted_at IS NULL
             """,
             (canonical,),
         )
@@ -944,7 +1188,7 @@ def add_file_with_id(file_id, title, file_data, format, voice=None, owner_email=
     
     for attempt in range(4):
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _db_connection() as conn:
                 cursor = conn.cursor()
 
                 # Check if file already exists
@@ -1082,14 +1326,14 @@ def update_position_by_file_id(file_id, position, owner_email=None):
 
     for attempt in range(4):
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _db_connection() as conn:
                 cursor = conn.cursor()
                 if owner_n:
                     cursor.execute(
                         """
                         UPDATE files
                         SET reading_position = ?, updated_at = ?, position_updated_at = ?
-                        WHERE filename = ? AND owner_email = ?
+                        WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
                         """,
                         (position, now, now, canonical, owner_n),
                     )
@@ -1098,7 +1342,7 @@ def update_position_by_file_id(file_id, position, owner_email=None):
                         """
                         UPDATE files
                         SET reading_position = ?, updated_at = ?, position_updated_at = ?
-                        WHERE filename = ?
+                        WHERE filename = ? AND deleted_at IS NULL
                         """,
                         (position, now, now, canonical),
                     )
@@ -1139,14 +1383,14 @@ def update_voice_by_file_id(file_id, voice, owner_email=None):
 
     for attempt in range(4):
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _db_connection() as conn:
                 cursor = conn.cursor()
                 if owner_n:
                     cursor.execute(
                         """
                         UPDATE files
                         SET voice = ?, updated_at = ?, voice_updated_at = ?
-                        WHERE filename = ? AND owner_email = ?
+                        WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
                         """,
                         (voice, now, now, canonical, owner_n),
                     )
@@ -1155,7 +1399,7 @@ def update_voice_by_file_id(file_id, voice, owner_email=None):
                         """
                         UPDATE files
                         SET voice = ?, updated_at = ?, voice_updated_at = ?
-                        WHERE filename = ?
+                        WHERE filename = ? AND deleted_at IS NULL
                         """,
                         (voice, now, now, canonical),
                     )
@@ -1203,7 +1447,7 @@ def update_translation_settings_by_file_id(file_id, target, mode, owner_email=No
 
     for attempt in range(4):
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _db_connection() as conn:
                 cursor = conn.cursor()
                 if owner_n:
                     cursor.execute(
@@ -1214,7 +1458,7 @@ def update_translation_settings_by_file_id(file_id, target, mode, owner_email=No
                             translation_mode = ?,
                             updated_at = ?,
                             translation_updated_at = ?
-                        WHERE filename = ? AND owner_email = ?
+                        WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
                         """,
                         (target_n, mode_n, now, now, canonical, owner_n),
                     )
@@ -1227,7 +1471,7 @@ def update_translation_settings_by_file_id(file_id, target, mode, owner_email=No
                             translation_mode = ?,
                             updated_at = ?,
                             translation_updated_at = ?
-                        WHERE filename = ?
+                        WHERE filename = ? AND deleted_at IS NULL
                         """,
                         (target_n, mode_n, now, now, canonical),
                     )
@@ -1288,10 +1532,29 @@ def update_highlights(file_id, highlights, owner_email=None):
 
     for attempt in range(4):
         try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            with _db_connection() as conn:
                 cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
 
                 scoped_file_id = f"{owner_n}::{canonical}" if owner_n else canonical
+
+                # Re-check within the write transaction so a concurrent trash
+                # operation cannot be followed by a highlight rewrite.
+                if owner_n:
+                    cursor.execute(
+                        """
+                        SELECT 1 FROM files
+                        WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
+                        """,
+                        (canonical, owner_n),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT 1 FROM files WHERE filename = ? AND deleted_at IS NULL",
+                        (canonical,),
+                    )
+                if cursor.fetchone() is None:
+                    return 0
 
                 # Clear existing highlights for this file
                 if owner_n:
@@ -1368,7 +1631,7 @@ def update_highlights(file_id, highlights, owner_email=None):
                         """
                         UPDATE files
                         SET updated_at = ?, highlights_updated_at = ?
-                        WHERE filename = ? AND owner_email = ?
+                        WHERE filename = ? AND owner_email = ? AND deleted_at IS NULL
                         """,
                         (created_at, created_at, canonical, owner_n),
                     )
@@ -1377,7 +1640,7 @@ def update_highlights(file_id, highlights, owner_email=None):
                         """
                         UPDATE files
                         SET updated_at = ?, highlights_updated_at = ?
-                        WHERE filename = ?
+                        WHERE filename = ? AND deleted_at IS NULL
                         """,
                         (created_at, created_at, canonical),
                     )
@@ -1401,38 +1664,51 @@ def get_highlights(file_id, owner_email=None):
     Returns:
         List of highlight dictionaries
     """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
     owner_n = _normalize_email(owner_email) if owner_email else None
     canonical = _resolve_canonical_filename(file_id, owner_n)
     if not canonical:
         logger.info("get_highlights: owner=%s file_id=%s count=%d", owner_n or "*", file_id, 0)
         return []
 
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
     scoped_file_id = f"{owner_n}::{canonical}" if owner_n else canonical
     if owner_n:
         cursor.execute(
             """
-            SELECT sentence_index, color, text, comment, phrase_split_version,
-                   page_index, word_start, words, annotation_id
-            FROM highlights
-            WHERE file_id = ? AND owner_email = ?
-            ORDER BY sentence_index
+            SELECT h.sentence_index, h.color, h.text, h.comment, h.phrase_split_version,
+                   h.page_index, h.word_start, h.words, h.annotation_id
+            FROM highlights AS h
+            WHERE h.file_id = ?
+              AND h.owner_email = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM files AS f
+                  WHERE f.filename = ?
+                    AND f.owner_email = ?
+                    AND f.deleted_at IS NULL
+              )
+            ORDER BY h.sentence_index
             """,
-            (scoped_file_id, owner_n),
+            (scoped_file_id, owner_n, canonical, owner_n),
         )
     else:
         cursor.execute(
             """
-            SELECT sentence_index, color, text, comment, phrase_split_version,
-                   page_index, word_start, words, annotation_id
-            FROM highlights
-            WHERE file_id = ?
-            ORDER BY sentence_index
+            SELECT h.sentence_index, h.color, h.text, h.comment, h.phrase_split_version,
+                   h.page_index, h.word_start, h.words, h.annotation_id
+            FROM highlights AS h
+            WHERE h.file_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM files AS f
+                  WHERE f.filename = ? AND f.deleted_at IS NULL
+              )
+            ORDER BY h.sentence_index
             """,
-            (scoped_file_id,),
+            (scoped_file_id, canonical),
         )
     
     rows = cursor.fetchall()
@@ -1472,7 +1748,7 @@ def get_reward_state(owner_email):
     owner_n = _normalize_email(owner_email)
     if not owner_n:
         return None
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         row = conn.execute(
             "SELECT snapshot_json FROM reward_state WHERE owner_email = ?",
             (owner_n,),
@@ -1499,7 +1775,7 @@ def update_reward_state(owner_email, snapshot):
     if len(serialized.encode("utf-8")) > 5 * 1024 * 1024:
         raise ValueError("Reward snapshot exceeds 5 MiB")
     now = datetime.utcnow().isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         conn.execute(
             """
             INSERT INTO reward_state (owner_email, snapshot_json, updated_at)
@@ -1514,7 +1790,7 @@ def update_reward_state(owner_email, snapshot):
 
 
 def get_reading_reminder_preference(owner_email):
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         row = conn.execute(
             "SELECT enabled, timezone, time FROM reading_reminder_preferences WHERE owner_email = ?",
             (_normalize_email(owner_email),),
@@ -1528,7 +1804,7 @@ def update_reading_reminder_preference(owner_email, enabled, timezone_name, remi
     owner_n = _normalize_email(owner_email)
     if not owner_n or not isinstance(enabled, bool):
         return False
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         conn.execute(
             """
             INSERT INTO reading_reminder_preferences (owner_email, enabled, timezone, time, updated_at)
@@ -1543,7 +1819,7 @@ def update_reading_reminder_preference(owner_email, enabled, timezone_name, remi
 
 
 def list_reading_reminder_recipients():
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         rows = conn.execute(
             """
             SELECT p.owner_email, p.timezone, p.time FROM reading_reminder_preferences p
@@ -1558,7 +1834,7 @@ def get_email_digest_preference(owner_email):
     owner_n = _normalize_email(owner_email)
     if not owner_n:
         return None
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         row = conn.execute(
             """
             SELECT enabled, timezone, updated_at
@@ -1583,7 +1859,7 @@ def update_email_digest_preference(owner_email, enabled, timezone_name):
     if not owner_n or not isinstance(enabled, bool):
         return False
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         conn.execute(
             """
             INSERT INTO email_digest_preferences (owner_email, enabled, timezone, updated_at)
@@ -1600,7 +1876,7 @@ def update_email_digest_preference(owner_email, enabled, timezone_name):
 
 def list_email_digest_recipients():
     """List registered accounts and their effective digest preferences."""
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         rows = conn.execute(
             """
             SELECT
@@ -1626,7 +1902,7 @@ def claim_email_digest_delivery(owner_email, digest_type, period_key):
         return False
     now = datetime.now(timezone.utc).isoformat()
     try:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with _db_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO email_digest_deliveries
@@ -1645,7 +1921,7 @@ def complete_email_digest_delivery(owner_email, digest_type, period_key):
     if not owner_n:
         return False
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.execute(
             """
             UPDATE email_digest_deliveries
@@ -1662,7 +1938,7 @@ def release_email_digest_delivery(owner_email, digest_type, period_key):
     owner_n = _normalize_email(owner_email)
     if not owner_n:
         return False
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_connection() as conn:
         cursor = conn.execute(
             """
             DELETE FROM email_digest_deliveries
