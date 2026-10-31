@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 
 import { TTSQueueManager } from "../src/modules/tts/synthesisQueue.js";
 
-test("replays the selected cached sentence immediately without synthesizing again", () => {
+test("replays a selected cached sentence only while playback is still requested", () => {
     let playbackStarts = 0;
+    let playbackRequested = false;
     const app = {
         state: {
             sentences: [{ audioReady: true }, { audioReady: true }],
@@ -12,15 +13,21 @@ test("replays the selected cached sentence immediately without synthesizing agai
             currentSentenceIndex: 0,
             isPlaying: false,
         },
-        audioManager: { playCurrentSentence: () => playbackStarts++ },
+        audioManager: {
+            hasPlaybackIntent: () => playbackRequested,
+            playCurrentSentence: () => playbackStarts++,
+        },
     };
     const queue = new TTSQueueManager(app);
 
     queue.add(0, true);
-    assert.equal(playbackStarts, 1);
+    assert.equal(playbackStarts, 0);
     assert.equal(queue.active, 0);
     assert.deepEqual(queue.queue, []);
 
+    playbackRequested = true;
+    queue.add(0, true);
+    assert.equal(playbackStarts, 1);
     queue.add(0);
     queue.add(1, true);
     app.state.isPlaying = true;
@@ -91,7 +98,7 @@ function readableSentence(index = 0) {
 }
 
 function queueFixture() {
-    const calls = { playback: 0, cancellations: 0, started: [], events: [] };
+    const calls = { playback: 0, cancellations: 0, started: [], events: [], icons: [] };
     const pending = [];
     const app = {
         config: { MAX_CONCURRENT_SYNTH: 1 },
@@ -101,6 +108,7 @@ function queueFixture() {
             currentSentenceIndex: 0,
             currentDocumentType: "pdf",
             isPlaying: false,
+            playbackRequested: true,
             playerState: { LOADING: "loading", DONE: "done" },
         },
         ttsEngine: {
@@ -112,14 +120,42 @@ function queueFixture() {
                 return completion.promise;
             },
         },
-        ui: { updatePlayButton: () => {} },
-        audioManager: { playCurrentSentence: () => calls.playback++ },
+        ui: { updatePlayButton: (value) => calls.icons.push(value) },
+        audioManager: {
+            hasPlaybackIntent: () => app.state.playbackRequested,
+            playCurrentSentence: () => calls.playback++,
+        },
         eventBus: { emit: (...args) => calls.events.push(args) },
     };
     const queue = new TTSQueueManager(app);
     app.ttsQueue = queue;
     return { app, queue, calls, pending };
 }
+
+test("finishing synthesis after pause does not restart playback", async () => {
+    const { app, queue, calls, pending } = queueFixture();
+    queue.add(0, true);
+    assert.equal(pending.length, 1);
+
+    app.state.playbackRequested = false;
+    app.state.sentences[0].audioReady = true;
+    pending[0].resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(calls.playback, 0);
+    assert.equal(queue.active, 0);
+    assert.deepEqual(calls.icons, ["loading", "done"]);
+});
+
+test("background page synthesis does not show a playback spinner", () => {
+    const { app, queue, calls } = queueFixture();
+    app.state.playbackRequested = false;
+
+    queue.add(0, true);
+
+    assert.equal(calls.playback, 0);
+    assert.deepEqual(calls.icons, []);
+});
 
 test("late completion after reset cannot play or remove a replacement task at the same index", async () => {
     const { app, queue, calls, pending } = queueFixture();

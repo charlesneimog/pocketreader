@@ -792,7 +792,7 @@ export class EPUBRenderer {
         const sentenceIndex = this._resolveSentenceIndexFromEvent(doc, event, sectionIndex);
         if (sentenceIndex < 0) return;
 
-        const wasPlaying = !!this.app?.state?.isPlaying;
+        const wasPlaying = !!this.app?.audioManager?.hasPlaybackIntent?.();
         try {
             await this.app?.audioManager?.stopPlayback?.(true);
         } catch (error) {

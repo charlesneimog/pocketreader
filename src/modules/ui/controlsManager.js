@@ -359,6 +359,7 @@ export class ControlsManager {
             (e) => {
                 const tag = e.target?.tagName || "";
                 if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return;
+                if (e.repeat && e.code === "Space") return;
 
                 const actions = {
                     Space: () => {

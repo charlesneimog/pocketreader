@@ -691,8 +691,8 @@ export class InteractionHandler {
         if (!mapped) return;
         const idx = this._hitTestPdfPhrase(mapped);
         if (idx >= 0) {
-            const wasPlaying = state.isPlaying;
-            this.app.audioManager.stopPlayback(true);
+            const wasPlaying = this.app.audioManager.hasPlaybackIntent();
+            await this.app.audioManager.stopPlayback(true);
             state.autoAdvanceActive = false;
             this.setHoveredSentence(idx, mapped);
             await this.app.pdfRenderer.renderSentence(idx);

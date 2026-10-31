@@ -10,11 +10,20 @@ export class TTSQueueManager {
         this.generation = 0;
     }
 
+    _shouldStartPlayback(idx) {
+        const { state } = this.app;
+        return (
+            idx === state.currentSentenceIndex &&
+            !state.isPlaying &&
+            this.app.audioManager?.hasPlaybackIntent?.() === true
+        );
+    }
+
     add(idx, priority = false) {
         const { state } = this.app;
         if (!state.generationEnabled) return;
         const sentence = state.sentences[idx];
-        if (priority && sentence?.audioReady && idx === state.currentSentenceIndex && !state.isPlaying) {
+        if (priority && sentence?.audioReady && this._shouldStartPlayback(idx)) {
             this.app.audioManager.playCurrentSentence();
         }
         if (!sentence || sentence.audioReady || sentence.audioInProgress) return;
@@ -44,7 +53,7 @@ export class TTSQueueManager {
         const idle = this.active === 0 && this.queue.length === 0;
         sentence.prefetchQueued = true;
         priority ? this.queue.unshift(idx) : this.queue.push(idx);
-        if (idle && !state.isPlaying) {
+        if (idle && this._shouldStartPlayback(idx)) {
             this.app.ui.updatePlayButton(state.playerState.LOADING);
         }
         this.run();
@@ -86,7 +95,7 @@ export class TTSQueueManager {
             await this.app.ttsEngine.synthesizeSequential(idx);
             if (generation !== this.generation || state.sentences[idx] !== sentence || !state.generationEnabled) return;
             // if sentence is same as current sentence, then begin playback immediately
-            if (idx === state.currentSentenceIndex && !state.isPlaying) {
+            if (this._shouldStartPlayback(idx)) {
                 this.app.ui.updatePlayButton(state.playerState.DONE);
                 this.app.audioManager.playCurrentSentence();
             }

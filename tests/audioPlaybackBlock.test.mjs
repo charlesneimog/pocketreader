@@ -2,6 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AudioManager } from "../src/modules/tts/audioManager.js";
 
+function deferred() {
+    let resolve;
+    const promise = new Promise((done) => {
+        resolve = done;
+    });
+    return { promise, resolve };
+}
+
 test("a playback block prevents delayed auto-advance from restarting speech", async () => {
     let starts = 0;
     const manager = Object.create(AudioManager.prototype);
@@ -32,6 +40,71 @@ test("a playback block prevents delayed auto-advance from restarting speech", as
     manager.removePlaybackBlock("required-reflection");
     await manager.playCurrentSentence();
     assert.equal(starts, 1);
+});
+
+test("pause cancels speech preparation and a ready sentence can start immediately", async () => {
+    const preparation = deferred();
+    const icons = [];
+    let staleStart = false;
+    let readyStarts = 0;
+    let preparationFinishes = 0;
+    const manager = Object.create(AudioManager.prototype);
+    manager._playbackBlocks = new Set();
+    manager._playbackContextId = 0;
+    manager._playbackContext = null;
+    manager._playPromise = null;
+    manager._mediaBridgeAudio = null;
+    manager._clearWaitingForAudio = () => {};
+    manager._pauseMediaBridge = () => {};
+    manager._primeMediaElementForUserGesture = () => {};
+    manager.app = {
+        config: { FADE_OUT_SEC: 0, MIN_GAIN: 0 },
+        state: {
+            isPlaying: false,
+            autoAdvanceActive: false,
+            stopRequested: false,
+            currentSentenceIndex: 1,
+            currentSource: null,
+            currentGain: null,
+            audioCtx: null,
+            playerState: { PLAY: "play", PAUSE: "pause", DONE: "done" },
+        },
+        ui: {
+            beginPlaybackPreparation: () => {},
+            finishPlaybackPreparation: () => preparationFinishes++,
+            updatePlayButton: (value) => icons.push(value),
+        },
+        pdfRenderer: { updateHighlightFullDoc: () => {} },
+        eventBus: { emit: () => {} },
+    };
+    manager._playCurrentSentence = async (context) => {
+        await preparation.promise;
+        if (manager._isContextActive(context) && !manager.app.state.stopRequested) staleStart = true;
+    };
+
+    manager.togglePlay();
+    const stalePromise = manager._playPromise;
+    assert.equal(manager.hasPlaybackIntent(), true);
+
+    manager.togglePlay();
+    assert.equal(manager._playbackContext, null);
+    assert.equal(manager._playPromise, null);
+    assert.equal(manager.app.state.stopRequested, true);
+    assert.equal(preparationFinishes, 1);
+    assert.equal(icons.at(-1), "pause");
+
+    manager.app.state.currentSentenceIndex = 0;
+    manager._playCurrentSentence = async (context) => {
+        if (!manager._isContextActive(context)) return;
+        readyStarts += 1;
+        manager.app.state.isPlaying = true;
+    };
+    await manager.playCurrentSentence();
+    assert.equal(readyStarts, 1);
+
+    preparation.resolve();
+    await stalePromise;
+    assert.equal(staleStart, false);
 });
 
 test("startup buffering requires the current and next readable phrase", () => {

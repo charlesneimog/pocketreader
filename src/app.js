@@ -1215,39 +1215,49 @@ export class PDFTTSApp {
 
     async nextSentence(manual = true) {
         const { state } = this;
+        const shouldResume = manual && this.audioManager.hasPlaybackIntent();
         if (state.currentDocumentType === "pdf" && state.currentSentence) {
             const pdf = state.pdf;
             const sentence = state.currentSentence;
-            this.audioManager.stopPlayback(true);
+            await this.audioManager.stopPlayback(true);
             if (manual) state.autoAdvanceActive = false;
             const nextIndex = await this.pdfLoader.getAdjacentSentenceIndex(sentence, 1);
             if (state.pdf !== pdf || !state.sentences.includes(sentence)) return;
-            if (nextIndex >= 0) await this.pdfRenderer.renderSentence(nextIndex);
+            if (nextIndex >= 0) {
+                await this.pdfRenderer.renderSentence(nextIndex);
+                if (shouldResume) await this.audioManager.playCurrentSentence();
+            }
             return;
         }
         if (state.currentSentenceIndex < state.sentences.length - 1) {
-            this.audioManager.stopPlayback(true);
+            await this.audioManager.stopPlayback(true);
             if (manual) state.autoAdvanceActive = false;
             await this.getActiveRenderer().renderSentence(state.currentSentenceIndex + 1);
+            if (shouldResume) await this.audioManager.playCurrentSentence();
         }
     }
 
     async prevSentence(manual = true) {
         const { state } = this;
+        const shouldResume = manual && this.audioManager.hasPlaybackIntent();
         if (state.currentDocumentType === "pdf" && state.currentSentence) {
             const pdf = state.pdf;
             const sentence = state.currentSentence;
-            this.audioManager.stopPlayback(true);
+            await this.audioManager.stopPlayback(true);
             if (manual) state.autoAdvanceActive = false;
             const previousIndex = await this.pdfLoader.getAdjacentSentenceIndex(sentence, -1);
             if (state.pdf !== pdf || !state.sentences.includes(sentence)) return;
-            if (previousIndex >= 0) await this.pdfRenderer.renderSentence(previousIndex);
+            if (previousIndex >= 0) {
+                await this.pdfRenderer.renderSentence(previousIndex);
+                if (shouldResume) await this.audioManager.playCurrentSentence();
+            }
             return;
         }
         if (state.currentSentenceIndex > 0) {
-            this.audioManager.stopPlayback(true);
+            await this.audioManager.stopPlayback(true);
             if (manual) state.autoAdvanceActive = false;
             await this.getActiveRenderer().renderSentence(state.currentSentenceIndex - 1);
+            if (shouldResume) await this.audioManager.playCurrentSentence();
         }
     }
 

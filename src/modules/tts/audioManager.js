@@ -506,6 +506,11 @@ export class AudioManager {
 
         if (clearContext) {
             this._playbackContext = null;
+            // A cancelled preparation must not block a new play request. The
+            // old promise keeps running only long enough to observe its stale
+            // context and exit; its `finally` handler is identity-guarded.
+            this._playPromise = null;
+            this.app.ui?.finishPlaybackPreparation?.();
         }
     }
 
@@ -518,9 +523,14 @@ export class AudioManager {
         this._playbackBlocks.delete(String(reason || "unspecified"));
     }
 
+    hasPlaybackIntent() {
+        const { state } = this.app;
+        return !!(state.isPlaying || state.autoAdvanceActive || this._playPromise);
+    }
+
     togglePlay() {
         const { state } = this.app;
-        if (state.isPlaying) {
+        if (this.hasPlaybackIntent()) {
             this.stopPlayback(true);
             state.autoAdvanceActive = false;
             this.app.ui.updatePlayButton(state.playerState.PAUSE);
