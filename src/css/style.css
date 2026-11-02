@@ -500,6 +500,66 @@ html.amoled-mode .playbar .dark\:bg-slate-700 {
     background-color: color-mix(in srgb, var(--amoled-reader-fg) 16%, #000000) !important;
 }
 
+/*
+ * Keep every reader action on one line. On narrow screens the regular
+ * buttons share the available width while the primary play button retains
+ * enough visual emphasis to remain easy to find.
+ */
+.playbar {
+    box-sizing: border-box;
+    flex-wrap: nowrap;
+    max-width: 100%;
+    padding-inline: max(0.25rem, var(--safe-area-inline));
+}
+
+.playbar .playbar__controls {
+    box-sizing: border-box;
+    flex-wrap: nowrap;
+    max-width: 100%;
+    min-width: 0;
+}
+
+.playbar .playbar__button,
+.playbar .playbar__button-slot {
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+.playbar .playbar__separator {
+    flex: 0 0 1px;
+}
+
+@media (max-width: 520px) {
+    .playbar .playbar__controls {
+        width: 100%;
+    }
+
+    .playbar .playbar__button,
+    .playbar .playbar__button-slot {
+        flex: 1 1 0;
+    }
+
+    .playbar .playbar__button {
+        box-sizing: border-box;
+        width: 100%;
+        padding: clamp(0.25rem, 1.8vw, 0.5rem);
+    }
+
+    .playbar .playbar__button--primary {
+        flex: 0 0 clamp(2.25rem, 10vw, 2.5rem);
+        height: clamp(2.25rem, 10vw, 2.5rem);
+        width: clamp(2.25rem, 10vw, 2.5rem);
+    }
+
+    .playbar .playbar__separator {
+        margin-inline: clamp(0.125rem, 1vw, 0.5rem);
+    }
+
+    .playbar .material-symbols-outlined {
+        font-size: clamp(1rem, 5vw, 1.25rem) !important;
+    }
+}
+
 html.amoled-mode .translate-popup {
     color: var(--amoled-reader-fg) !important;
 }
@@ -1302,25 +1362,6 @@ html {
 
 .peer:checked ~ .peer-checked-block {
     display: block;
-}
-
-@media (max-width: 768px) {
-    /* Compress floating toolbar on mobile */
-    .fixed.bottom-4.inset-x-0 > div {
-        flex-wrap: wrap;
-        gap: 0.25rem;
-        padding: 0.5rem;
-        max-width: 95vw;
-        margin: 0 auto;
-    }
-
-    .fixed.bottom-4.inset-x-0 button {
-        padding: 0.4rem;
-    }
-
-    .fixed.bottom-4.inset-x-0 .material-symbols-outlined {
-        font-size: 1.25rem !important;
-    }
 }
 
 /*

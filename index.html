@@ -967,15 +967,15 @@
         </div>
 
         <!-- Floating Toolbar -->
-        <div class="playbar fixed bottom-1 inset-x-0 flex flex-wrap justify-center z-20">
+        <div class="playbar fixed bottom-1 inset-x-0 flex justify-center z-20">
             <div
-                class="flex flex-wrap items-center rounded-lg bg-background-light/80 shadow-lg backdrop-blur-md dark:bg-background-dark/80"
+                class="playbar__controls flex items-center rounded-lg bg-background-light/80 shadow-lg backdrop-blur-md dark:bg-background-dark/80"
             >
                 <button
                     id="home-btn"
                     title="Return to main page"
                     aria-label="Return to main page"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                 >
                     <span class="material-symbols-outlined text-xl sm:text-lg text-slate-600 dark:text-slate-300"
                         >home</span
@@ -986,7 +986,7 @@
                     id="open-file"
                     title="Open a new PDF file"
                     aria-label="Open a new PDF file"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                 >
                     <span class="material-symbols-outlined text-xl sm:text-lg text-slate-600 dark:text-slate-300"
                         >folder_open</span
@@ -997,20 +997,20 @@
                     id="export-highlights"
                     title="Save the current PDF with highlights and Reading Tree notes"
                     aria-label="Save the current PDF with highlights and Reading Tree notes"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                 >
                     <span class="material-symbols-outlined text-xl sm:text-lg text-slate-600 dark:text-slate-300"
                         >save</span
                     >
                 </button>
 
-                <div class="mx-2 h-6 w-px bg-slate-300 dark:bg-slate-700"></div>
+                <div class="playbar__separator mx-2 h-6 w-px bg-slate-300 dark:bg-slate-700"></div>
 
                 <button
                     id="prev-page"
                     title="Go to previous sentence"
                     aria-label="Go to previous sentence"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                 >
                     <span class="material-symbols-outlined text-xl sm:text-lg text-slate-600 dark:text-slate-300"
                         >skip_previous</span
@@ -1021,7 +1021,7 @@
                     id="play-toggle"
                     title="Play or pause the current sentence"
                     aria-label="Play or pause the current sentence"
-                    class="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-white shadow"
+                    class="playbar__button playbar__button--primary flex h-10 w-10 items-center justify-center rounded-full bg-primary text-white shadow"
                 >
                     <span class="material-symbols-outlined">play_arrow</span>
                 </button>
@@ -1030,20 +1030,20 @@
                     id="next-page"
                     title="Go to next sentence"
                     aria-label="Go to next sentence"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                 >
                     <span class="material-symbols-outlined text-xl sm:text-lg text-slate-600 dark:text-slate-300"
                         >skip_next</span
                     >
                 </button>
 
-                <div class="mx-2 h-6 w-px bg-slate-300 dark:bg-slate-700"></div>
+                <div class="playbar__separator mx-2 h-6 w-px bg-slate-300 dark:bg-slate-700"></div>
 
                 <button
                     id="save-highlight"
                     title="Configure highlights"
                     aria-label="Configure highlights"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                 >
                     <span class="material-symbols-outlined text-xl sm:text-lg text-slate-600 dark:text-slate-300"
                         >format_ink_highlighter</span
@@ -1052,7 +1052,7 @@
 
                 <button
                     id="save-comment"
-                    class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                    class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                     title="Self-Host Server Configurations"
                     aria-label="Self-Host Server Configurations"
                 >
@@ -1062,12 +1062,12 @@
                 </button>
 
                 <!-- Settings Menu -->
-                <div class="relative">
+                <div class="playbar__button-slot relative">
                     <button
                         id="settings-button"
                         title="General configuration and options"
                         aria-label="General configuration and options"
-                        class="flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
+                        class="playbar__button flex items-center justify-center rounded p-2 hover:bg-primary/10 dark:hover:bg-primary/20"
                     >
                         <span class="material-symbols-outlined text-lg sm:text-lg text-slate-600 dark:text-slate-300"
                             >settings</span
